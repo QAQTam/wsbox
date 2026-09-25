@@ -1,0 +1,33 @@
+[package]
+name = "wsbox-review"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Experimental review component: decides whether a wsbox change set may be applied"
+
+[lib]
+name = "wsbox_review"
+path = "src/lib.rs"
+
+[[bin]]
+name = "wsbox-review"
+path = "src/main.rs"
+
+[features]
+default = []
+# The TypeSafe (Jev) assessor. Off by default so the core has no network stack
+# and no vendor dependency; `wsbox` itself must stay free of both.
+jev = ["dep:ureq"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+clap = { version = "4", features = ["derive"] }
+wsbox = { path = "../.." }
+ureq = { version = "3", features = ["json"], optional = true }
+
+[dev-dependencies]
+tempfile = "3"

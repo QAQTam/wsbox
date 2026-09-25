@@ -160,6 +160,61 @@ calls had an unwatched subtree.
 > the overlay" — does not work. Build scripts write source files, and a model can
 > run `cargo` from `python`. Path class is the only stable boundary.
 
+## Review component (experimental)
+
+`wsbox` decides *where writes land*. It does not decide *whether they should be
+kept* — that is `crates/wsbox-review`, an experimental component that answers one
+question: **may this change set be applied without a person looking at it?**
+
+```
+permission gate    can this command run?         (unchanged, untouched)
+wsbox sandbox      where do writes land?         (unchanged)
+wsbox-review       should this change be kept?   <-- new
+wsbox apply        write it to the workspace     (unchanged)
+```
+
+Those layers are orthogonal, so turning the review component on **changes no
+existing approval behaviour** — it only answers "should the apply step ask?".
+`Decision` has no "allow command" variant and `ChangeSetState` has no field for a
+command, so an auto-approval cannot widen a permission boundary by construction.
+
+```bash
+wsbox-review --session s1 --task "change f to return 2"
+
+needs review: `beyond_task` was not evaluated
+  - `beyond_task` was not evaluated
+  - `breaks_contract` was not evaluated
+```
+
+It is built around an `Assessor` seam rather than around a vendor:
+
+```
+Battery (versioned questions)
+  └─ Assessor ──┬─ Rules    deterministic, free, offline, exact
+                ├─ Jev      TypeSafe API, behind --features jev
+                └─ Local    ← reserved for a small local model
+       └─ Policy / Router   backend-independent
+              └─ Decision
+```
+
+Two invariants make it fail closed, and both are enforced by the type system
+rather than by remembering to check:
+
+- **a missing answer is a reason to ask a human, never a reason to guess** — if
+  the battery asked something the assessors could not answer, no auto-approval is
+  possible;
+- **`AutoApply` can only be produced by the router** — the variant lives in a
+  private enum, so an expired API key, a rate limit, a timeout or a stale local
+  model all land on `Review` by construction.
+
+Deterministic hard rules are checked *before* any model and cannot be overridden:
+a change to `.github/`, a lockfile, or a diff too large to review in full is held
+whatever a model thinks of it. A model is a judgment layer, not a boundary.
+
+The default mode is `RulesOnly`, which never auto-approves a real change — it
+exercises the whole pipeline with the model slot empty, so the failure paths are
+the ones that get tested. See [`docs/review.md`](docs/review.md).
+
 ## Audit and retention
 
 **The ledger and the content store have separate retention policies.** That
@@ -283,6 +338,8 @@ Prototype. Working and covered by tests:
 - per-call diffs, delete/add/atomic-rename detection, suspicious-shrink flagging
 - CAS, hash-chained ledger, `apply` / `restore` / `discard` with conflict detection
 - audit surface: `query` / `history` / `status`, and `gc` with baseline-immortal retention
+- selective passthrough for build output
+- experimental review component (`crates/wsbox-review`), rules-only by default
 
 Not yet:
 
@@ -292,3 +349,5 @@ Not yet:
 - landlock/seccomp enforcement layered on top of the mount isolation
 - chunk-level storage for the large-file-rewritten-repeatedly case
 - automatic retention: `gc` is currently manual
+- the hosted (Jev) assessor has not been exercised against the live API
+- shadow mode: today the caller just ignores `may_auto_apply()`
