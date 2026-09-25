@@ -191,8 +191,14 @@ calls had an unwatched subtree.
 - `diff` describes the **end state** of the call: a file written and then
   restored before the command exits produces no change. Intermediate writes
   within one call are not currently observable.
-- `path` is a UTF-8, workspace-relative path. Lossless handling of non-UTF-8
-  Unix filenames is still an open protocol issue and must not be assumed.
+- `path` is a workspace-relative **key**, not necessarily the file's name. When
+  the name is valid UTF-8 and does not start with `!hex:`, the key is the name
+  itself. Otherwise the key is `!hex:` followed by the hex of the name's raw
+  bytes — Unix filenames are byte strings, and a lossy conversion would map two
+  distinct names onto U+FFFD and merge them into one entry. The encoding is
+  injective: a file literally named `!hex:...` is escaped too. Use
+  `wsbox::fsutil::{encode_key, decode_key}` to convert; `restore --path` and the
+  ledger query filters accept either the key or a plain relative path.
 - `diffTruncated` marks a diff clipped to 64 KiB. The full text is always in the
   CAS, keyed by `beforeSha` / `afterSha`.
 - `suspicious` means the file lost at least 80% of its content and was at least

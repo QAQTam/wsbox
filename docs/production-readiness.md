@@ -13,7 +13,7 @@
 验收命令：
 
 ```bash
-cargo test --workspace --all-features    # 当前 128 项全绿
+cargo test --workspace --all-features    # 当前 134 项全绿
 cargo clippy --workspace --all-features --all-targets
 ```
 
@@ -41,6 +41,7 @@ DoD 的**主干已经达成**：本轮把 bash 常见的写文件方式逐条钉
 | 重写为相同字节 | **不报** | `no_op_rewrite_produces_no_change` |
 | 同尺寸不同内容 | 报 modify，且有 diff | `same_size_rewrite_is_reported_with_a_diff` |
 | 文件名含 `\`（Unix 普通字节） | 路径不失真，`apply` 生效 | `a_backslash_in_a_filename_is_not_a_directory_separator` |
+| 文件名不是合法 UTF-8 | 两个不同文件**不塌缩**，`apply`/`restore` 按原始字节生效 | `non_utf8_filenames_are_distinct_and_applied` |
 | `sed -i`（临时文件 + rename） | 报一个 modify | `atomic_rename_is_one_modify` |
 | 二进制改写 | 报 modify，`diff: null` | `binary_change_is_reported_without_a_text_diff` |
 | `chmod` | 报 chmod 并落到真实文件 | `a_mode_change_is_journaled_and_applied`、`snapshot_mode_reports_a_mode_change` |
@@ -77,6 +78,7 @@ session id 不能借 `../` 写到账本目录之外（`a_session_id_cannot_escap
 | 9 | Unix 文件名中的 `\` 被改写成 `/` | diff 路径不存在，两个文件可能塌缩成一个，`apply` 失败 | 保留反斜杠原始字节；只有 `/` 是 Unix 路径分隔符 |
 | 10 | 非特权 overlayfs 未启用 `userxattr` | 删除/移动 lower 目录返回 `EIO`，bash 无法完成操作 | 挂载选项加 `userxattr`，在真实 overlay 上验证目录删除 |
 | 11 | baseline 目录在状态比较中按“不存在”处理 | 目录 whiteout 被静默丢弃，`rm -rf dir` 报 0 个变更 | 目录作为有类型、无内容的状态参与比较，并可按 baseline 重建 |
+| 12 | 非 UTF-8 文件名被 `to_string_lossy` 压成 U+FFFD | 两个不同文件塌缩成一条 `add �`，`apply` 报"content for � is missing" | 路径 key 字节精确：UTF-8 名字即自身，否则 `!hex:<原始字节>`；marker 也参与转义，保证单射（`docs/protocol.md`） |
 
 ---
 
@@ -84,14 +86,11 @@ session id 不能借 `../` 写到账本目录之外（`a_session_id_cannot_escap
 
 ### P0 —— 会破坏 DoD 正确性
 
-**1. 非 UTF-8 文件名会漏报并串味。**
-`fsutil::scan_tree` 用 `to_string_lossy()` 生成 key，`Change.path` 是 `String`。
-实测：一次调用里创建 `\xff` 和 `\xfe` 两个文件，**只报一条** `add �`（两个文件塌缩成一个 key），
-而且该 key 在真实文件系统上不存在，`apply` 会报
-`content for � (sha) is missing from the CAS`。
-> 修复方向：路径 key 改成字节精确表示（`OsString` 内部 + 协议层约定一种转义编码，
-> 例如 `%FF` 或 `\xFF`），或显式拒绝并在 `warnings` 里报告"该路径无法表示"。
-> 这是**协议级决定**，不是纯实现问题 —— 它决定 `Change.path` 的语义。
+**1. 非 UTF-8 文件名 —— 本轮已修复。** 路径 key 现在字节精确（UTF-8 名字即自身，
+否则 `!hex:<原始字节>`，marker 本身也转义以保证单射），两个不同文件不再塌缩，
+`apply`/`restore`/`history` 都按原始字节工作。见 §3 第 12 条与 `docs/protocol.md`。
+剩下的是**调用方**要处理的事：拿到 `!hex:` 前缀的 path 时不要当成文件名直接显示，
+需要解码（`wsbox::fsutil::decode_key`）或原样回传。
 
 **2. 单次调用内的中间态不可见。** 只观测调用结束态：命令先截断再恢复，diff 为空。
 README 已承认（fanotify/FUSE 未做）。对 DoD 来说这是"定义边界"而非缺陷，
@@ -116,7 +115,7 @@ README 已承认（fanotify/FUSE 未做）。对 DoD 来说这是"定义边界"�
 **9. CI 已补上，但 MSRV 只是一个声明。** `.github/workflows/ci.yml` 现在跑
 `cargo test --workspace --all-features` + `cargo clippy -- -D warnings`，
 并用 `cargo check` 在声明的最低版本上验证。
-当前声明是 **1.92**（1.92.0 已在本机实测：check / 128 项测试 / clippy -D warnings 全绿）。
+当前声明是 **1.92**（1.92.0 已在本机实测：check / 全量测试 / clippy -D warnings 全绿）。
 注意这是**维护策略**而非技术下限 —— 代码真正需要的是 1.88（2024 edition 的 let-chains），
 依赖图里最高的只有 1.85（clap / getrandom / ureq）；`Cargo.lock` 里的
 `time 0.3.55`、`cookie_store 0.22.1` 虽然写着 `rust-version = 1.88.0`，

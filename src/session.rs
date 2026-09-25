@@ -202,9 +202,9 @@ impl Session {
     /// path that the session has not touched yet.
     fn baseline_path(&self, key: &str) -> PathBuf {
         match self.meta.mode {
-            Mode::Snapshot => self.root.join("base").join(key),
+            Mode::Snapshot => self.root.join("base").join(fsutil::key_to_relative(key)),
             // Overlay: the live workspace *is* the baseline for untouched paths.
-            _ => self.meta.workspace.join(key),
+            _ => self.meta.workspace.join(fsutil::key_to_relative(key)),
         }
     }
 
@@ -624,8 +624,8 @@ impl Session {
     /// snapshot mode has to snapshot the pre-call content before running.
     fn observation_path(&self, key: &str) -> PathBuf {
         match self.meta.mode {
-            Mode::Snapshot => self.meta.workspace.join(key),
-            _ => self.root.join("upper").join(key),
+            Mode::Snapshot => self.meta.workspace.join(fsutil::key_to_relative(key)),
+            _ => self.root.join("upper").join(fsutil::key_to_relative(key)),
         }
     }
 
@@ -1012,7 +1012,7 @@ impl Session {
                 if is_at_baseline(entry) {
                     continue;
                 }
-                let path = self.meta.workspace.join(key);
+                let path = self.meta.workspace.join(fsutil::key_to_relative(key));
                 // Compare content, existence and mode. Hashing only bytes would
                 // miss a user `chmod` and then silently overwrite it. `hash_path`
                 // also treats a symlink's target as its content rather than
@@ -1044,7 +1044,7 @@ impl Session {
             if is_at_baseline(entry) {
                 continue;
             }
-            let target = self.meta.workspace.join(key);
+            let target = self.meta.workspace.join(fsutil::key_to_relative(key));
             if entry.current_exists {
                 let Some(sha) = entry.current_sha.clone() else {
                     // No digest means no content. A directory is reproduced as
@@ -1115,8 +1115,8 @@ impl Session {
                 continue;
             };
             let target = match self.meta.mode {
-                Mode::Snapshot => self.meta.workspace.join(&key),
-                _ => self.root.join("upper").join(&key),
+                Mode::Snapshot => self.meta.workspace.join(fsutil::key_to_relative(&key)),
+                _ => self.root.join("upper").join(fsutil::key_to_relative(&key)),
             };
 
             if entry.baseline_exists {

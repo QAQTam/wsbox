@@ -5,6 +5,7 @@
 //! the capability probe *agrees* with reality and skip with a printed reason —
 //! a test that cannot fail is worse than no test.
 
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 
@@ -1430,6 +1431,70 @@ fn a_command_exiting_125_still_reports_its_changes() {
             .as_deref()
             .is_some_and(|diff| diff.contains("+changed")),
         "the diff must show what the command wrote"
+    );
+}
+
+/// Names that are not valid UTF-8 used to collapse onto U+FFFD: two distinct
+/// files became one entry, and the reported path did not exist on disk, so
+/// `apply` failed with "content is missing from the CAS".
+#[test]
+fn non_utf8_filenames_are_distinct_and_applied() {
+    if !overlay_available() {
+        skip("overlayfs unavailable in a user namespace");
+        return;
+    }
+
+    /// Every entry in the real workspace, as raw bytes, sorted.
+    fn names(fixture: &Fixture) -> Vec<Vec<u8>> {
+        let mut names: Vec<Vec<u8>> = std::fs::read_dir(fixture.workspace.path())
+            .expect("read_dir")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().as_bytes().to_vec())
+            .collect();
+        names.sort();
+        names
+    }
+
+    let fixture = Fixture::new();
+    fixture.write("a.txt", "one\n");
+    let mut session = fixture.open("non-utf8", Mode::Overlay);
+
+    // Two files whose names differ only in a byte that is not valid UTF-8.
+    let script = r#"printf 'one\n' > "$(printf '\377')"; printf 'two\n' > "$(printf '\376')""#;
+    let result = exec(&mut session, "call-1", script);
+
+    assert_eq!(
+        result.changes.len(),
+        2,
+        "two distinct files must not collapse into one key: {:?}",
+        result.changes.iter().map(|c| &c.path).collect::<Vec<_>>()
+    );
+    for change in &result.changes {
+        assert!(
+            change.path.starts_with("!hex:"),
+            "a non-UTF-8 name is reported escaped, got {:?}",
+            change.path
+        );
+    }
+    assert_eq!(
+        names(&fixture),
+        vec![b"a.txt".to_vec()],
+        "the real workspace is untouched before apply"
+    );
+
+    // Restoring them clears the session view without ever writing to disk.
+    session.restore(None, true).expect("restore");
+    assert!(session.changes().expect("changes").is_empty());
+    assert_eq!(names(&fixture), vec![b"a.txt".to_vec()]);
+
+    // Recreate and apply for real: both files must land on disk.
+    let again = exec(&mut session, "call-2", script);
+    assert_eq!(again.changes.len(), 2);
+    let applied = session.apply(false).expect("apply");
+    assert!(applied.ok, "{:?}", applied.conflicts);
+    assert_eq!(
+        names(&fixture),
+        vec![b"a.txt".to_vec(), vec![0xfe], vec![0xff]]
     );
 }
 

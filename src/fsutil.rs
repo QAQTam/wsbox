@@ -86,9 +86,9 @@ pub fn scan_tree(root: &Path) -> Result<Manifest> {
             Ok(relative) => relative,
             Err(_) => continue,
         };
-        // On Unix, backslash is an ordinary filename byte. Replacing it with
-        // `/` invents a different path and can make two distinct files collide.
-        let key = relative.to_string_lossy().to_string();
+        // On Unix, backslash is an ordinary filename byte, and a name may not
+        // be valid UTF-8 at all — `encode_key` is what keeps both cases exact.
+        let key = encode_key(relative);
         let metadata = match fs::symlink_metadata(path) {
             Ok(metadata) => metadata,
             // A file can vanish between readdir and stat; that is a real
@@ -199,6 +199,49 @@ pub fn read_file(path: &Path) -> Result<Vec<u8>> {
 pub fn read_link_bytes(path: &Path) -> Result<Vec<u8>> {
     let target = fs::read_link(path).map_err(|error| Error::io(path, error))?;
     Ok(target.as_os_str().as_bytes().to_vec())
+}
+
+/// Marker for a path key that is not its own UTF-8 name.
+///
+/// Unix paths are byte strings, not text: `\xff` is a legal filename and
+/// `to_string_lossy` maps it — and every other invalid sequence — onto U+FFFD,
+/// which silently merges two distinct files into one key and produces a path
+/// that does not exist. So a key is the path's own bytes when they are valid
+/// UTF-8, and a hex escape behind this prefix otherwise.
+///
+/// The encoding is injective because the marker is escaped too: a real file
+/// named `!hex:ff` is encoded as `!hex:` + the hex of its own bytes, so it can
+/// never be confused with the escaped form of the byte `\xff`.
+pub const KEY_ESCAPE: &str = "!hex:";
+
+/// Canonical key for a workspace-relative path.
+pub fn encode_key(relative: &Path) -> String {
+    let bytes = relative.as_os_str().as_bytes();
+    match std::str::from_utf8(bytes) {
+        Ok(text) if !text.starts_with(KEY_ESCAPE) => text.to_string(),
+        _ => format!("{KEY_ESCAPE}{}", hex(bytes)),
+    }
+}
+
+/// Inverse of [`encode_key`]: the exact bytes the key stands for.
+pub fn decode_key(key: &str) -> Result<Vec<u8>> {
+    match key.strip_prefix(KEY_ESCAPE) {
+        Some(encoded) => unhex(encoded),
+        None => Ok(key.as_bytes().to_vec()),
+    }
+}
+
+/// Resolve a canonical key to a path relative to `base`.
+///
+/// Keys come from [`encode_key`] (or from a caller that round-tripped one), so
+/// decoding is the only step here; a key that does not decode is treated as a
+/// literal name rather than failing, which keeps a hand-written `!hex:...`
+/// filename usable.
+pub fn key_to_relative(key: &str) -> PathBuf {
+    match decode_key(key) {
+        Ok(bytes) => PathBuf::from(std::ffi::OsStr::from_bytes(&bytes).to_os_string()),
+        Err(_) => PathBuf::from(key),
+    }
 }
 
 /// Write via a sibling temp file plus `rename(2)`, so a reader never observes a
@@ -317,33 +360,141 @@ pub fn ensure_dir(path: &Path) -> Result<()> {
     fs::create_dir_all(path).map_err(|error| Error::io(path, error))
 }
 
-/// Normalise a caller-supplied path into a workspace-relative key.
+/// Normalise a caller-supplied path into a canonical workspace-relative key.
 ///
-/// Rejects absolute paths and `..` escapes so a change can never be reported
-/// (or applied) outside the workspace.
+/// Accepts either a canonical key (what `changes` reports, including the
+/// `!hex:` escape) or a plain relative path, and rejects absolute paths and
+/// `..` escapes so a change can never be reported — or applied — outside the
+/// workspace.
 pub fn relative_key(path: &str) -> Result<String> {
+    // Already escaped: validate what it decodes to, then pass it through
+    // unchanged. A name that merely *looks* like an escape but does not decode
+    // falls through and is treated as the literal name it is.
+    if let Some(encoded) = path.strip_prefix(KEY_ESCAPE)
+        && let Ok(bytes) = unhex(encoded)
+    {
+        validate_relative(Path::new(std::ffi::OsStr::from_bytes(&bytes)))?;
+        return Ok(path.to_string());
+    }
+
     let trimmed = path.trim_start_matches("./").trim_end_matches('/');
     if trimmed.is_empty() {
         return Err(Error::Invalid("empty path".into()));
     }
-    if Path::new(trimmed).is_absolute() {
-        return Err(Error::Invalid(format!("absolute path not allowed: {path}")));
+    let relative = Path::new(trimmed);
+    validate_relative(relative)?;
+    Ok(encode_key(relative))
+}
+
+/// Reject anything that could resolve outside the workspace.
+fn validate_relative(relative: &Path) -> Result<()> {
+    if relative.is_absolute() {
+        return Err(Error::Invalid(format!(
+            "absolute path not allowed: {}",
+            relative.display()
+        )));
     }
-    for component in Path::new(trimmed).components() {
+    for component in relative.components() {
         match component {
             std::path::Component::ParentDir => {
-                return Err(Error::Invalid(format!("path escapes workspace: {path}")));
+                return Err(Error::Invalid(format!(
+                    "path escapes workspace: {}",
+                    relative.display()
+                )));
             }
             std::path::Component::RootDir | std::path::Component::Prefix(_) => {
-                return Err(Error::Invalid(format!("path escapes workspace: {path}")));
+                return Err(Error::Invalid(format!(
+                    "path escapes workspace: {}",
+                    relative.display()
+                )));
             }
             _ => {}
         }
     }
-    Ok(trimmed.to_string())
+    Ok(())
 }
 
 /// Resolve a workspace-relative key to an absolute path, refusing escapes.
 pub fn resolve_in(workspace: &Path, key: &str) -> Result<PathBuf> {
-    Ok(workspace.join(relative_key(key)?))
+    Ok(workspace.join(key_to_relative(&relative_key(key)?)))
+}
+
+fn unhex(text: &str) -> Result<Vec<u8>> {
+    if !text.len().is_multiple_of(2) {
+        return Err(Error::Invalid(format!("malformed path key: {text}")));
+    }
+    let digits = text.as_bytes();
+    let mut out = Vec::with_capacity(digits.len() / 2);
+    for pair in digits.chunks(2) {
+        let high = hex_digit(pair[0])?;
+        let low = hex_digit(pair[1])?;
+        out.push((high << 4) | low);
+    }
+    Ok(out)
+}
+
+fn hex_digit(byte: u8) -> Result<u8> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        other => Err(Error::Invalid(format!(
+            "malformed path key: {:?} is not a hex digit",
+            other as char
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_utf8_path_is_its_own_key() {
+        assert_eq!(encode_key(Path::new("src/main.rs")), "src/main.rs");
+        assert_eq!(decode_key("src/main.rs").unwrap(), b"src/main.rs");
+    }
+
+    /// The bug this encoding exists for: `to_string_lossy` maps both of these
+    /// onto U+FFFD, so two distinct files became one entry.
+    #[test]
+    fn non_utf8_paths_get_distinct_keys() {
+        let one = encode_key(Path::new(std::ffi::OsStr::from_bytes(b"\xff")));
+        let two = encode_key(Path::new(std::ffi::OsStr::from_bytes(b"\xfe")));
+        assert_ne!(one, two);
+        assert_eq!(one, "!hex:ff");
+        assert_eq!(decode_key(&one).unwrap(), b"\xff");
+        assert_eq!(decode_key(&two).unwrap(), b"\xfe");
+    }
+
+    /// The marker is escaped too, so a real file named `!hex:ff` cannot be
+    /// confused with the escaped form of the byte `\xff`.
+    #[test]
+    fn a_name_that_looks_escaped_is_escaped() {
+        let literal = encode_key(Path::new("!hex:ff"));
+        assert_ne!(literal, "!hex:ff");
+        assert_eq!(decode_key(&literal).unwrap(), b"!hex:ff");
+        assert_eq!(
+            key_to_relative(&literal),
+            PathBuf::from("!hex:ff"),
+            "the round trip has to come back to the literal name"
+        );
+    }
+
+    #[test]
+    fn relative_key_round_trips_and_still_rejects_escapes() {
+        assert_eq!(relative_key("src/main.rs").unwrap(), "src/main.rs");
+        let escaped = relative_key("!hex:ff").unwrap();
+        assert_eq!(escaped, "!hex:ff");
+        assert!(relative_key("../../etc/passwd").is_err());
+        assert!(relative_key("/etc/passwd").is_err());
+        // A key that decodes to an escape is rejected, not silently resolved.
+        assert!(relative_key("!hex:2e2e2f2e2e2f657463").is_err());
+    }
+
+    #[test]
+    fn a_utf8_subdirectory_is_not_escaped() {
+        assert_eq!(encode_key(Path::new("a/b.txt")), "a/b.txt");
+        assert_eq!(key_to_relative("a/b.txt"), PathBuf::from("a/b.txt"));
+    }
 }
