@@ -1,0 +1,46 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # The overlay tests need bubblewrap plus unprivileged user namespaces.
+      # Without these they *skip* rather than fail, and a skipped test proves
+      # nothing — so install the one and lift the AppArmor restriction that
+      # Ubuntu 23.10+ puts on the other.
+      - name: Install bubblewrap
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+      - name: Allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+
+      - name: Show what this host can actually do
+        run: cargo run --quiet -- capabilities
+
+      - name: Test
+        run: cargo test --workspace --all-features
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-features --all-targets -- -D warnings
+
+  msrv:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # `rust-version` in Cargo.toml is a promise; this job is what keeps it
+      # honest. It is currently the floor for `let` chains in the 2024 edition.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88.0"
+
+      - name: Check on the declared minimum
+        run: cargo check --workspace --all-features
