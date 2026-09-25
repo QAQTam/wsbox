@@ -215,6 +215,56 @@ The default mode is `RulesOnly`, which never auto-approves a real change — it
 exercises the whole pipeline with the model slot empty, so the failure paths are
 the ones that get tested. See [`docs/review.md`](docs/review.md).
 
+### Shadow mode and the training corpus
+
+The responsible way to switch a review model on is to measure it first, because
+an auto-approval that is wrong is invisible until much later.
+
+```bash
+wsbox-review run --session s1 --call c2 --mode hosted --shadow --record --task "..."
+wsbox-review resolve --session s1 --review 2 --outcome reject --note "emptied the function"
+wsbox-review stats --session s1
+```
+
+```
+reviews 4   resolved 4   with fallbacks 0
+
+model said         applied  rejected  unresolved
+auto_apply               1         0           0
+review                   1         0           0
+hold                     0         2           0
+
+no dangerous auto-approvals in 4 resolved review(s).
+```
+
+`dangerousAutoApprove` — the model would have applied something a person
+rejected — has to be zero before auto-approve is enabled.
+
+The same records export to an auditable CSV, which is the corpus you would
+train a local model on:
+
+```bash
+wsbox-review export --all --include-diffs --out corpus.csv
+wsbox-review verify --input corpus.csv
+```
+
+Each row carries a digest chained to the previous one, so editing a cell breaks
+the chain and `verify` names the row. Every row also points at the wsbox ledger
+head it was taken under, so it traces back to the change set it describes.
+
+The schema keeps two kinds of label apart, because they are not
+interchangeable:
+
+- `q_*` columns are the **model's** per-question answers — dense, usable for
+  distillation, but they carry the model's biases;
+- `human_outcome` is the **person's** verdict — ground truth, but a *weak*
+  label: it is a verdict on the change set, while the battery asks eight
+  separate questions. Training the per-question heads on it directly is
+  multiple-instance learning wearing a binary-classification hat.
+
+Unanswered questions export as empty cells, not zeros: "not evaluated" and
+"evaluated as zero" are different facts.
+
 ## Audit and retention
 
 **The ledger and the content store have separate retention policies.** That

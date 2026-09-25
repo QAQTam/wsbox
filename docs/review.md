@@ -255,31 +255,105 @@ pub enum Calibration {
 
 `Chain` 已经支持组合：规则先跑（免费、精确），本地模型补剩下的，Jev 只在本地模型也答不上时才用。三级串联不需要改任何策略代码。
 
-## 9. 数据积累——这才是"抽掉 Jev 强依赖"的真正路径
+## 9. 数据积累：可审计 CSV
 
 抽象接口只解决了"能换"。要真的换得掉，得有数据。
 
-`--record` 把每次评估写进 `<session>/review.jsonl`：
-
-```jsonc
-{
-  "atMs": 1758800000000,
-  "mode": "hosted",
-  "task": "把 f 的返回值改成 2",
-  "decision": { "action": "review", "rationale": { ... } },
-  "batteryFingerprint": "a3f1c9d2e8b70456",
-  "precomputed": { ... }
-}
+```bash
+wsbox-review export --session s1 --include-diffs --out review.csv
+wsbox-review export --all --include-diffs --out corpus.csv
+wsbox-review verify --input review.csv
 ```
 
-**每一次模型评估 + 人类最终决定 = 一条标注样本。**
+### 训练上有三个不同的目标，标签不同
 
-跑几个月就有了自己的数据集，可以：
-- 拟合校准曲线，看 Jev 在你这个领域是否真的校准（很可能不是，领域偏）
-- 训练/微调本地分类器
-- 验证阈值：把历史决策重放一遍，看新阈值会放行哪些当时人工拒绝的
+这张表决定了 CSV 必须存什么：
 
-所以 `--record` 不是日志装饰。**跑 Jev 是在为不再需要 Jev 攒资本。**
+| 目标 | 标签 | 密度 | 坑 |
+|---|---|---|---|
+| 蒸馏 hosted 模型 | 它的逐题答案 | 每行都有 | 继承它的偏差 |
+| 拟合校准曲线 | 人类决定 | 每行已解决 | 需要有 resolution |
+| 直接训练各题的头 | 人类决定 | 每行已解决 | **弱标签** |
+
+第三行是陷阱。**人类的 accept/reject 是打在变更集上的标签，而电池问的是 8 个独立问题。** "人拒绝了"只能说明至少有一个 hazard 成立，不能说明是哪个。直接拿它训练 6 个二分类头，是**多示例学习**伪装成二分类，结果会教出见谁咬谁的头。
+
+所以 CSV 把两种标签并排放，并明确哪个是哪个：
+
+- `q_*` 列 = 模型的答案（可用于蒸馏）
+- `human_outcome` = 人的决定（可用于校准，或作为弱标签，但要自己处理弱在哪）
+
+### 列结构（61 列）
+
+```
+# 溯源
+row_index  prev_row_hash  row_hash  session_id  review_id  call_id
+ledger_head  battery_id  battery_version  battery_fingerprint
+assessor  model  mode  shadow  created_at_ms
+
+# 人类真值
+resolved_at_ms  resolved  human_outcome  human_note
+
+# 模型输出
+assessed_action  may_auto_apply  hard_rule_count  hard_rules
+fallback_count  fallback_kinds  fired_hazards
+
+# 确定性事实（引擎算的）
+task  files_changed  files_added  files_deleted  max_shrink_ratio
+sensitive_path_count  sensitive_paths  any_diff_truncated
+
+# 变更内容
+diff_bytes  diff_sha256  [diff]
+
+# 逐题答案（每问 2–3 列）
+q_lost_content_p  q_lost_content_confidence  q_lost_content_calibration
+q_severity_level  q_severity_confidence  q_severity_calibration
+q_category_category  q_category_confidence  q_category_calibration
+...
+```
+
+两个刻意的设计：
+
+**未回答的题留空，不写 0。** "没评估"和"评估为 0"是两件不同的事，混为一谈会让训练脚本学到谎话。
+
+**`policy` 快照也记在 review.jsonl 里。** 没有它，决策无法复现，"这个为什么被自动放行"就没有答案。
+
+### 可审计性
+
+每行带一个摘要，链到上一行，覆盖该行字段的规范序列化。改任何一个单元格都会断链：
+
+```
+$ wsbox-review verify --input review.csv
+4 row(s) verified, chain head 98ef201eb319...
+
+$ # 把第 2 行的 hold 改成 auto_apply
+$ wsbox-review verify --input review-tampered.csv
+4 row(s) checked, 1 broken
+broken rows: [2]
+```
+
+每行还有 `ledger_head`，指回 wsbox 账本当时的链头——所以一行能追溯到它描述的那份变更集。
+
+**CSV 是派生产物，`review.jsonl` 才是真相来源。** 导出可以从它复现，链的作用是让派生副本值得信任。
+
+### 实测（4 次真实评估）
+
+```
+row  call    assessed   human  shrink  diff_B  fired
+  1    c1  auto_apply   apply  0.0000     126
+  2    c2        hold  reject  0.8026     247  beyond_task:0.95:review; breaks_contract:0.75:hold; ...
+  3    c3        hold  reject  0.0000     145  beyond_task:0.35:review
+  4    c4  auto_apply   apply  0.0000     136
+```
+
+61 列 × 4 行 = 4.5 KB（含 diff）。这就是训练集的一行行长什么样。
+
+### 从 CSV 到本地模型
+
+1. **先拟合校准曲线**（最省事）：`assessed_action` 的置信度 vs `human_outcome`，画可靠性图。这直接告诉你 Jev 在你这个领域是否真的校准——很可能不是，领域偏。
+2. **再蒸馏**：用 `q_*` 列训练 8 个头。数据量大，但学的是 Jev 的判断，不是真值。
+3. **最后才是真值训练**：需要处理弱标签问题（多示例学习，或者只在"模型和人一致"的子集上训练）。
+
+第 1 步就能回答"阈值该定多少"，而且不需要训练任何东西。
 
 ## 10. 分阶段落地
 

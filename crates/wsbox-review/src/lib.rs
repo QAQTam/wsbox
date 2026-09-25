@@ -33,6 +33,7 @@
 
 pub mod assessor;
 pub mod battery;
+pub mod export;
 pub mod policy;
 pub mod question;
 pub mod rules;

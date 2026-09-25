@@ -43,6 +43,12 @@ enum Command {
 
     /// Compare model decisions against human ones.
     Stats(StatsArgs),
+
+    /// Export the review history as an auditable CSV.
+    Export(ExportArgs),
+
+    /// Check an exported CSV's row chain.
+    Verify(VerifyArgs),
 }
 
 #[derive(clap::Args)]
@@ -121,6 +127,37 @@ struct StatsArgs {
     json: bool,
 }
 
+#[derive(clap::Args)]
+struct ExportArgs {
+    /// A single session, or `--all` for every session in the ledger directory.
+    #[arg(long)]
+    session: Option<String>,
+
+    #[arg(long, conflicts_with = "session")]
+    all: bool,
+
+    #[arg(long)]
+    ledger_dir: Option<PathBuf>,
+
+    /// Write here instead of stdout.
+    #[arg(long)]
+    out: Option<PathBuf>,
+
+    /// Embed the diffs. Off gives a compact audit-only table.
+    #[arg(long)]
+    include_diffs: bool,
+}
+
+#[derive(clap::Args)]
+struct VerifyArgs {
+    /// The CSV to check, or `-` for stdin.
+    #[arg(long, default_value = "-")]
+    input: String,
+
+    #[arg(long)]
+    json: bool,
+}
+
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum ModeArg {
     /// Deterministic rules only. Never calls a model.
@@ -163,6 +200,8 @@ fn run(cli: &Cli) -> Result<(), String> {
         Command::Run(args) => run_review(args),
         Command::Resolve(args) => run_resolve(args),
         Command::Stats(args) => run_stats(args),
+        Command::Export(args) => run_export(args),
+        Command::Verify(args) => run_verify(args),
     }
 }
 
@@ -457,6 +496,125 @@ fn run_stats(args: &StatsArgs) -> Result<(), String> {
     Ok(())
 }
 
+/* --------------------------------- export -------------------------------- */
+
+fn ledger_dir_of(args: &Option<PathBuf>) -> PathBuf {
+    args.clone()
+        .unwrap_or_else(wsbox::session::default_ledger_dir)
+}
+
+/// Every session directory under the ledger root.
+fn all_sessions(dir: &std::path::Path) -> Result<Vec<String>, String> {
+    let sessions = dir.join("sessions");
+    let entries = std::fs::read_dir(&sessions)
+        .map_err(|error| format!("cannot list {}: {error}", sessions.display()))?;
+    let mut ids: Vec<String> = entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().is_dir())
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .collect();
+    ids.sort();
+    Ok(ids)
+}
+
+fn collect_logs(args: &ExportArgs) -> Result<Vec<wsbox_review::export::SessionLog>, String> {
+    let dir = ledger_dir_of(&args.ledger_dir);
+    let ids: Vec<String> = match (&args.session, args.all) {
+        (Some(session), _) => vec![session.clone()],
+        (None, true) => all_sessions(&dir)?,
+        (None, false) => {
+            return Err("pass --session <id> or --all".into());
+        }
+    };
+
+    let mut logs = Vec::new();
+    for id in ids {
+        let session = load_session(&id, Some(&dir))?;
+        let text = match std::fs::read_to_string(review_log(&session)) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("cannot read review log for {id}: {error}")),
+        };
+        let entries = wsbox_review::export::LogEntry::parse(&text)
+            .map_err(|error| format!("{id}: {error}"))?;
+        logs.push(wsbox_review::export::SessionLog {
+            session_id: id,
+            entries,
+        });
+    }
+    Ok(logs)
+}
+
+fn run_export(args: &ExportArgs) -> Result<(), String> {
+    use std::io::Write;
+
+    let logs = collect_logs(args)?;
+    let options = wsbox_review::export::ExportOptions {
+        include_diffs: args.include_diffs,
+    };
+    let report = wsbox_review::export::export(&logs, &options)?;
+
+    match &args.out {
+        Some(path) => {
+            std::fs::write(path, &report.csv)
+                .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
+            eprintln!(
+                "{} row(s), {} resolved, {} session(s) -> {}",
+                report.rows,
+                report.resolved,
+                logs.len(),
+                path.display()
+            );
+            eprintln!("chain head: {}", report.head);
+        }
+        None => {
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            out.write_all(report.csv.as_bytes())
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+fn run_verify(args: &VerifyArgs) -> Result<(), String> {
+    let text = if args.input == "-" {
+        let mut buffer = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buffer)
+            .map_err(|error| error.to_string())?;
+        buffer
+    } else {
+        std::fs::read_to_string(&args.input)
+            .map_err(|error| format!("cannot read {}: {error}", args.input))?
+    };
+
+    let report = wsbox_review::export::verify_csv(&text)?;
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).map_err(|error| error.to_string())?
+        );
+    } else if report.ok() {
+        println!(
+            "{} row(s) verified, chain head {}",
+            report.rows, report.head
+        );
+    } else {
+        println!(
+            "{} row(s) checked, {} broken",
+            report.rows,
+            report.broken.len()
+        );
+        println!("broken rows: {:?}", report.broken);
+    }
+
+    if !report.ok() {
+        return Err("the CSV chain does not verify".into());
+    }
+    Ok(())
+}
+
 /* --------------------------------- loading ------------------------------- */
 
 fn load_policy(path: Option<&PathBuf>) -> Result<Policy, String> {
@@ -536,6 +694,7 @@ fn record(
     outcome: &ReviewOutcome,
 ) -> Result<(), String> {
     use std::io::Write;
+    use wsbox_review::export::{LogEntry, ReviewRecord};
 
     let path = review_log(session);
     let existing = read_log(session)?;
@@ -547,28 +706,37 @@ fn record(
         .unwrap_or(0)
         + 1;
 
+    let record = ReviewRecord {
+        review_id,
+        at_ms: wsbox::ledger::now_ms(),
+        mode: mode_name(outcome.mode).to_string(),
+        shadow: outcome.shadow,
+        task: args.task.clone(),
+        call: args.call.clone(),
+        decision: serde_json::to_value(&outcome.decision).map_err(|error| error.to_string())?,
+        assessed_action: action_name(outcome.assessed_action()).to_string(),
+        battery_fingerprint: outcome.battery.fingerprint(),
+        // Recorded so the decision can be replayed. Without it, "why was this
+        // auto-approved?" has no answer.
+        policy: serde_json::to_value(&policy_of(args)?).map_err(|error| error.to_string())?,
+        ledger_head: session.ledger_head().ok(),
+        precomputed: outcome.state.precomputed.clone(),
+        diff: wsbox_review::export::concat_diffs(&outcome.state.changes),
+    };
+
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)
         .map_err(|error| format!("cannot open {}: {error}", path.display()))?;
-
-    let entry = serde_json::json!({
-        "kind": "review",
-        "reviewId": review_id,
-        "atMs": wsbox::ledger::now_ms(),
-        "mode": mode_name(outcome.mode),
-        "shadow": outcome.shadow,
-        "task": args.task,
-        "call": args.call,
-        "decision": outcome.decision,
-        "assessedAction": action_name(outcome.assessed_action()),
-        "batteryFingerprint": outcome.battery.fingerprint(),
-        "precomputed": outcome.state.precomputed,
-    });
-    let line = serde_json::to_string(&entry).map_err(|error| error.to_string())?;
+    let line = serde_json::to_string(&LogEntry::Review(Box::new(record)))
+        .map_err(|error| error.to_string())?;
     writeln!(file, "{line}")
         .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
     eprintln!("recorded review {review_id}");
     Ok(())
+}
+
+fn policy_of(args: &RunArgs) -> Result<Policy, String> {
+    load_policy(args.policy.as_ref())
 }
