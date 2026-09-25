@@ -6,3 +6,6 @@
 .env
 .env.*
 *.key
+
+# local code-graph index cache
+.codegraph/
