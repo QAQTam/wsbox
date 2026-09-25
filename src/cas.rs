@@ -83,6 +83,11 @@ impl Cas {
         fsutil::ensure_dir(parent)?;
         let temp = parent.join(format!(".wsbox-restore-{}", std::process::id()));
         fs::copy(&source, &temp).map_err(|error| Error::io(&temp, error))?;
+        // A recorded state can replace a leaf of a different type (file ->
+        // directory, symlink -> file). `rename` cannot replace a non-empty
+        // directory, so clear the old leaf only after the replacement is fully
+        // copied and ready.
+        fsutil::remove_tree(target)?;
         fs::rename(&temp, target).map_err(|error| Error::io(target, error))?;
         Ok(true)
     }

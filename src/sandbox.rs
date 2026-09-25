@@ -29,8 +29,12 @@ use nix::unistd::{ForkResult, Pid, fork};
 use crate::error::{Error, Result};
 use crate::protocol::Network;
 
-/// Exit status used by the child when sandbox *setup* fails, so the parent can
-/// tell "the sandbox could not start" apart from "the command failed".
+/// Exit status used by the child when sandbox *setup* fails.
+///
+/// The parent does **not** read this. A command is free to exit 125 itself —
+/// plenty do — and treating that as a setup failure discarded the change set of
+/// a command that had already modified the workspace. The status pipe is what
+/// tells the two apart; see [`run`].
 const SETUP_FAILED: i32 = 125;
 
 /// Where the overlay lives. All four directories must be on the same
@@ -84,6 +88,11 @@ impl Outcome {
 }
 
 pub fn run(request: &RunRequest) -> Result<Outcome> {
+    // Validate first. A rejected passthrough must not leave a directory behind
+    // outside the workspace — `ensure_dir` on `/work/../elsewhere` would create
+    // exactly the path the check is about to refuse.
+    let plan = Plan::build(request)?;
+
     if let Some(overlay) = &request.overlay {
         for dir in [&overlay.upper, &overlay.work, &overlay.merged] {
             crate::fsutil::ensure_dir(dir)?;
@@ -96,8 +105,6 @@ pub fn run(request: &RunRequest) -> Result<Outcome> {
             crate::fsutil::ensure_dir(path)?;
         }
     }
-
-    let plan = Plan::build(request)?;
 
     let stdout_file = std::fs::File::create(&request.stdout_path)
         .map_err(|error| Error::io(&request.stdout_path, error))?;
@@ -115,10 +122,18 @@ pub fn run(request: &RunRequest) -> Result<Outcome> {
     let mut ready: [RawFd; 2] = [0; 2];
     // Parent -> child: "maps are written, carry on".
     let mut go: [RawFd; 2] = [0; 2];
+    // Child -> parent: "setup failed". Nothing is written on success and the
+    // write end is close-on-exec, so the parent reads EOF exactly when the
+    // command reached `execvp` — which leaves the exit code free for the
+    // command itself to use.
+    let mut status: [RawFd; 2] = [0; 2];
     if unsafe { libc::pipe(ready.as_mut_ptr()) } != 0 {
         return Err(Error::IoBare(std::io::Error::last_os_error()));
     }
     if unsafe { libc::pipe(go.as_mut_ptr()) } != 0 {
+        return Err(Error::IoBare(std::io::Error::last_os_error()));
+    }
+    if unsafe { libc::pipe2(status.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
         return Err(Error::IoBare(std::io::Error::last_os_error()));
     }
 
@@ -130,27 +145,38 @@ pub fn run(request: &RunRequest) -> Result<Outcome> {
     // because the parent may be multi-threaded (a library consumer, or a test
     // harness), and a lock held by another thread would be copied as held.
     match unsafe { fork() }.map_err(|error| Error::Sandbox(format!("fork failed: {error}")))? {
-        ForkResult::Child => child(&plan, stdout_fd, stderr_fd, devnull_fd, ready, go),
+        ForkResult::Child => child(&plan, stdout_fd, stderr_fd, devnull_fd, ready, go, status),
         ForkResult::Parent { child } => {
             unsafe {
                 libc::close(ready[1]);
                 libc::close(go[0]);
+                libc::close(status[1]);
             }
 
-            if needs_userns {
-                if let Err(error) = write_maps(child, ready[0], go[1]) {
-                    unsafe {
-                        libc::close(ready[0]);
-                        libc::close(go[1]);
-                    }
-                    let _ = kill(child, Signal::SIGKILL);
-                    let _ = waitpid(child, None);
-                    return Err(error);
+            if needs_userns && let Err(error) = write_maps(child, ready[0], go[1]) {
+                unsafe {
+                    libc::close(ready[0]);
+                    libc::close(go[1]);
+                    libc::close(status[0]);
                 }
+                let _ = kill(child, Signal::SIGKILL);
+                let _ = waitpid(child, None);
+                return Err(error);
             }
             unsafe {
                 libc::close(ready[0]);
                 libc::close(go[1]);
+            }
+
+            // Setup failed if the child wrote a byte instead of reaching exec.
+            let reached_exec = exec_reached(status[0])?;
+            unsafe { libc::close(status[0]) };
+            if !reached_exec {
+                let _ = waitpid(child, None);
+                return Err(Error::Sandbox(format!(
+                    "sandbox setup failed; see {}",
+                    request.stderr_path.display()
+                )));
             }
 
             let (status, timed_out) = wait_with_timeout(child, request.timeout)?;
@@ -162,19 +188,34 @@ pub fn run(request: &RunRequest) -> Result<Outcome> {
                 _ => (128, None),
             };
 
-            if exit_code == SETUP_FAILED {
-                return Err(Error::Sandbox(format!(
-                    "sandbox setup failed; see {}",
-                    request.stderr_path.display()
-                )));
-            }
-
             Ok(Outcome {
                 exit_code,
                 signal,
                 timed_out,
                 duration_ms,
             })
+        }
+    }
+}
+
+/// Wait for the child to either reach `execvp` or report a setup failure.
+///
+/// The status pipe's write end is close-on-exec, so EOF means the command is
+/// running; a byte means setup failed before exec and the reason is on stderr.
+fn exec_reached(fd: RawFd) -> Result<bool> {
+    let mut byte = [0u8; 1];
+    loop {
+        let read = unsafe { libc::read(fd, byte.as_mut_ptr().cast(), 1) };
+        match read {
+            1 => return Ok(false),
+            0 => return Ok(true),
+            _ => {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(Error::Sandbox(format!("status pipe: {error}")));
+            }
         }
     }
 }
@@ -237,7 +278,7 @@ impl Plan {
         let mount = match &request.overlay {
             Some(overlay) => {
                 let data = format!(
-                    "lowerdir={},upperdir={},workdir={}",
+                    "lowerdir={},upperdir={},workdir={},userxattr",
                     overlay.lower.display(),
                     overlay.upper.display(),
                     overlay.work.display()
@@ -275,10 +316,12 @@ fn child(
     devnull_fd: RawFd,
     ready: [RawFd; 2],
     go: [RawFd; 2],
+    status: [RawFd; 2],
 ) -> ! {
     unsafe {
         libc::close(ready[0]);
         libc::close(go[1]);
+        libc::close(status[0]);
 
         // stdin from /dev/null: agent commands must never block on a prompt.
         if devnull_fd >= 0 {
@@ -290,7 +333,11 @@ fn child(
 
         if plan.needs_userns {
             if libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) != 0 {
-                fail(b"unshare(CLONE_NEWUSER|CLONE_NEWNS) failed", last_errno());
+                fail(
+                    status[1],
+                    b"unshare(CLONE_NEWUSER|CLONE_NEWNS) failed",
+                    last_errno(),
+                );
             }
             // Hand control to the parent so it can write uid_map/gid_map.
             if libc::write(ready[1], b"R".as_ptr().cast(), 1) != 1 {
@@ -313,7 +360,7 @@ fn child(
                     mount.data.as_ptr().cast(),
                 ) != 0
             {
-                fail(b"mount overlayfs failed", last_errno());
+                fail(status[1], b"mount overlayfs failed", last_errno());
             }
         } else {
             libc::close(ready[1]);
@@ -330,7 +377,7 @@ fn child(
 
         libc::chdir(plan.cwd.as_ptr());
         libc::execvp(plan.argv_ptrs[0], plan.argv_ptrs.as_ptr());
-        fail(b"execvp failed", last_errno());
+        fail(status[1], b"execvp failed", last_errno());
     }
 }
 
@@ -338,10 +385,12 @@ fn last_errno() -> i32 {
     unsafe { *libc::__errno_location() }
 }
 
-/// Write a diagnostic to stderr and exit with [`SETUP_FAILED`].
+/// Write a diagnostic to stderr, tell the parent setup failed, and exit.
 ///
-/// Stack-only, deliberately: this runs in a forked child.
-fn fail(message: &[u8], errno: i32) -> ! {
+/// Stack-only, deliberately: this runs in a forked child. `status_fd` is the
+/// close-on-exec pipe that distinguishes "the sandbox could not start" from
+/// "the command exited with that code".
+fn fail(status_fd: RawFd, message: &[u8], errno: i32) -> ! {
     let mut buffer = [0u8; 192];
     let mut len = 0usize;
     len += append(&mut buffer[len..], b"wsbox: sandbox setup failed: ");
@@ -351,6 +400,7 @@ fn fail(message: &[u8], errno: i32) -> ! {
     len += append(&mut buffer[len..], b")\n");
     unsafe {
         libc::write(libc::STDERR_FILENO, buffer.as_ptr().cast(), len);
+        libc::write(status_fd, b"E".as_ptr().cast(), 1);
         libc::_exit(SETUP_FAILED);
     }
 }
@@ -578,23 +628,47 @@ fn would_shadow(dir: &Path, needed: &[&Path]) -> bool {
 ///   sandbox's reach;
 /// * it can never cover `.git`, so history cannot be rewritten through a path
 ///   that the journal does not watch.
+///
+/// "Inside the workspace" has to mean the path the kernel will actually resolve
+/// to, not the string the caller passed. `/work/../etc` is *lexically* prefixed
+/// by `/work` and *really* `/etc`, and a symlink inside the workspace pointing
+/// out of it is the same trick with the filesystem's help — so `..` is refused
+/// outright and the remaining path is resolved before it is compared.
 fn validate_passthrough(workspace: &Path, paths: &[PathBuf]) -> Result<()> {
+    let workspace_real = canonicalize_best_effort(workspace);
+
     for path in paths {
-        if path == workspace {
+        if !path.is_absolute() {
+            return Err(Error::Invalid(format!(
+                "passthrough {} must be an absolute path",
+                path.display()
+            )));
+        }
+        if path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            return Err(Error::Invalid(format!(
+                "passthrough {} must not contain `..`",
+                path.display()
+            )));
+        }
+
+        let real = canonicalize_best_effort(path);
+        if real == workspace_real {
             return Err(Error::Invalid(
                 "the workspace root cannot be a passthrough path".into(),
             ));
         }
-        if !path.starts_with(workspace) {
+        if !real.starts_with(&workspace_real) {
             return Err(Error::Invalid(format!(
                 "passthrough {} is outside the workspace {}",
                 path.display(),
                 workspace.display()
             )));
         }
-        let relative = path
-            .strip_prefix(workspace)
-            .unwrap_or_else(|_| Path::new(""));
+
+        let relative = real.strip_prefix(&workspace_real).unwrap_or(Path::new(""));
         if matches!(
             relative.components().next(),
             Some(std::path::Component::Normal(name)) if name == ".git"
@@ -605,6 +679,36 @@ fn validate_passthrough(workspace: &Path, paths: &[PathBuf]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Resolve a path as far as it exists on disk, without requiring it to exist.
+///
+/// A passthrough directory may legitimately be created by the call that needs
+/// it, so the check cannot insist on `canonicalize()` succeeding; it walks up to
+/// the deepest ancestor that does exist and re-appends the rest. That is enough
+/// to catch a symlinked component pointing out of the workspace, which is the
+/// case a purely lexical comparison would miss.
+fn canonicalize_best_effort(path: &Path) -> PathBuf {
+    if let Ok(real) = path.canonicalize() {
+        return real;
+    }
+
+    let mut remainder: Vec<std::ffi::OsString> = Vec::new();
+    let mut current = path.to_path_buf();
+    while let Some(parent) = current.parent().map(Path::to_path_buf) {
+        if let Some(name) = current.file_name() {
+            remainder.push(name.to_os_string());
+        }
+        if let Ok(real) = parent.canonicalize() {
+            let mut resolved = real;
+            for name in remainder.iter().rev() {
+                resolved.push(name);
+            }
+            return resolved;
+        }
+        current = parent;
+    }
+    path.to_path_buf()
 }
 
 pub fn which(program: &str) -> Option<String> {
@@ -691,5 +795,101 @@ mod tests {
     fn network_deny_adds_netns() {
         let argv = build_bwrap_argv(&base_request()).unwrap();
         assert!(argv.contains(&"--unshare-net".to_string()));
+    }
+
+    /// `/work/../etc` is lexically prefixed by `/work` and really `/etc`. The
+    /// old check accepted it, which turned a "cannot widen the sandbox's reach"
+    /// invariant into a way to bind any directory read-write.
+    #[test]
+    fn passthrough_may_not_escape_with_a_parent_dir() {
+        let error = validate_passthrough(Path::new("/work"), &[PathBuf::from("/work/../etc")])
+            .expect_err("`..` must be refused");
+        assert!(error.to_string().contains("must not contain"), "{error}");
+    }
+
+    /// A symlink inside the workspace that points outside it is the same escape
+    /// with the filesystem's help: the string is inside, the resolution is not.
+    #[test]
+    fn passthrough_may_not_follow_a_symlink_out_of_the_workspace() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workspace = tmp.path().join("work");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        std::fs::create_dir_all(&outside).expect("outside");
+        std::os::unix::fs::symlink(&outside, workspace.join("link")).expect("symlink");
+
+        assert!(
+            validate_passthrough(&workspace, &[workspace.join("link")]).is_err(),
+            "a passthrough that resolves outside the workspace must be refused"
+        );
+    }
+
+    /// The legitimate case still has to work, including for a directory the
+    /// call itself will create.
+    #[test]
+    fn passthrough_inside_the_workspace_is_accepted() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workspace = tmp.path().join("work");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+
+        validate_passthrough(&workspace, &[workspace.join("target")])
+            .expect("a not-yet-existing subtree inside the workspace is fine");
+        assert!(
+            validate_passthrough(&workspace, std::slice::from_ref(&workspace)).is_err(),
+            "the workspace root itself is not a subtree"
+        );
+    }
+
+    /// A real setup failure has to stay distinguishable from a command's exit
+    /// code. This forces one the portable way — overlayfs needs a directory as
+    /// its lower layer — and asserts the parent reports a setup failure rather
+    /// than handing back an exit status.
+    ///
+    /// On a host where user namespaces are blocked the failure happens one step
+    /// earlier, at `unshare`, which is the same code path.
+    #[test]
+    fn a_failed_setup_is_not_reported_as_a_command_exit() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let overlay = OverlayDirs {
+            lower: tmp.path().join("lower"),
+            upper: tmp.path().join("upper"),
+            work: tmp.path().join("work"),
+            merged: tmp.path().join("merged"),
+        };
+        // A file where the lower layer must be a directory: the mount cannot
+        // succeed, whatever the kernel or the host's capabilities are.
+        std::fs::write(&overlay.lower, b"not a directory").expect("lower file");
+        for dir in [&overlay.upper, &overlay.work, &overlay.merged] {
+            std::fs::create_dir_all(dir).expect("dir");
+        }
+
+        let request = RunRequest {
+            argv: vec!["/bin/true".into()],
+            cwd: overlay.merged.clone(),
+            workspace: overlay.lower.clone(),
+            writable_roots: Vec::new(),
+            passthrough: Vec::new(),
+            network: Network::Deny,
+            max_open_files: None,
+            sandboxed: false,
+            root_readonly: true,
+            hide_paths: Vec::new(),
+            overlay: Some(overlay),
+            stdout_path: tmp.path().join("out"),
+            stderr_path: tmp.path().join("err"),
+            timeout: Some(Duration::from_secs(10)),
+        };
+
+        let error = run(&request).expect_err("the sandbox cannot start");
+        assert!(
+            error.to_string().contains("setup failed"),
+            "a setup failure must not be reported as a command exit: {error}"
+        );
+        assert!(
+            !std::fs::read_to_string(&request.stderr_path)
+                .unwrap_or_default()
+                .is_empty(),
+            "the reason must reach the captured stderr"
+        );
     }
 }

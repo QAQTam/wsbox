@@ -147,7 +147,10 @@ wsbox exec --session s1 --call c1 --passthrough target -- cargo build
 Two invariants make this safe to offer at all, and both are enforced:
 
 - a passthrough path must be **inside the workspace**, so it cannot widen the
-  sandbox's reach;
+  sandbox's reach. "Inside" is the path the kernel resolves to, not the string
+  the caller passed: `..` is refused and symlinks are resolved before the
+  comparison, so neither `/work/../etc` nor a link out of the workspace gets
+  bound read-write;
 - it can never cover **`.git`**, so history cannot be rewritten through a path
   the journal does not watch.
 
@@ -385,12 +388,17 @@ The overlay tests need unprivileged user namespaces. Rather than passing
 vacuously on a host that cannot provide them, they check the capability probe
 and print a skip reason — a test that cannot fail is worse than no test.
 
+For the current production-readiness assessment, including the remaining P0/P1
+gaps, see [`docs/production-readiness.md`](docs/production-readiness.md).
+
 ## Status
 
 Prototype. Working and covered by tests:
 
 - overlay + snapshot modes, capability probing
 - per-call diffs, delete/add/atomic-rename detection, suspicious-shrink flagging
+- symlinks and permission bits are journaled as content and reproduced by
+  `apply` / `restore`
 - CAS, hash-chained ledger, `apply` / `restore` / `discard` with conflict detection
 - audit surface: `query` / `history` / `status`, and `gc` with baseline-immortal retention
 - selective passthrough for build output

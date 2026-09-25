@@ -10,11 +10,14 @@
 //!     would silently turn "deleted" into "empty";
 //!   * directories exist in the upper tree as soon as anything inside them is
 //!     copied up, so directory-only changes must not be reported as file
-//!     changes.
+//!     changes;
+//!   * a symlink's content is its target, so retargeting a link is a content
+//!     change rather than an invisible one.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{Read, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -83,7 +86,9 @@ pub fn scan_tree(root: &Path) -> Result<Manifest> {
             Ok(relative) => relative,
             Err(_) => continue,
         };
-        let key = relative.to_string_lossy().replace('\\', "/");
+        // On Unix, backslash is an ordinary filename byte. Replacing it with
+        // `/` invents a different path and can make two distinct files collide.
+        let key = relative.to_string_lossy().to_string();
         let metadata = match fs::symlink_metadata(path) {
             Ok(metadata) => metadata,
             // A file can vanish between readdir and stat; that is a real
@@ -97,7 +102,10 @@ pub fn scan_tree(root: &Path) -> Result<Manifest> {
         } else if file_type.is_dir() {
             (Kind::Dir, None)
         } else if file_type.is_symlink() {
-            (Kind::Symlink, None)
+            // A symlink's content is its target. Hashing it is what makes a
+            // retarget a change like any other, instead of invisible because
+            // the link's own bytes never move.
+            (Kind::Symlink, Some(hash_bytes(&read_link_bytes(path)?)))
         } else if file_type.is_file() {
             (Kind::File, Some(hash_file(path)?))
         } else {
@@ -141,6 +149,27 @@ pub fn hash_file(path: &Path) -> Result<String> {
     Ok(hex(&hasher.finalize()))
 }
 
+/// Digest of a path's *content*, using the engine's definition of content.
+///
+/// For a regular file that is its bytes; for a symlink it is the link target,
+/// not the bytes the link resolves to. `hash_file` follows links, which is
+/// right when the caller already knows it has a file and wrong for anything
+/// that compares a path against a recorded digest — a dangling link has no
+/// bytes to hash at all, and a link to a file would hash the wrong thing.
+pub fn hash_path(path: &Path) -> Result<String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            Ok(hash_bytes(&read_link_bytes(path)?))
+        }
+        Ok(metadata) if metadata.is_file() => hash_file(path),
+        Ok(_) => Err(Error::Invalid(format!(
+            "{} has no content to hash",
+            path.display()
+        ))),
+        Err(error) => Err(Error::io(path, error)),
+    }
+}
+
 pub fn hash_bytes(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -159,6 +188,17 @@ fn hex(bytes: &[u8]) -> String {
 
 pub fn read_file(path: &Path) -> Result<Vec<u8>> {
     fs::read(path).map_err(|error| Error::io(path, error))
+}
+
+/// A symlink's target, as raw bytes.
+///
+/// This is the byte string that [`hash_bytes`] digests for a symlink, and the
+/// byte string that is stored in the CAS — so a link is journaled and
+/// reproducible exactly like a file, rather than being a path whose content is
+/// whatever it currently points at.
+pub fn read_link_bytes(path: &Path) -> Result<Vec<u8>> {
+    let target = fs::read_link(path).map_err(|error| Error::io(path, error))?;
+    Ok(target.as_os_str().as_bytes().to_vec())
 }
 
 /// Write via a sibling temp file plus `rename(2)`, so a reader never observes a

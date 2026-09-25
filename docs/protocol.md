@@ -188,6 +188,11 @@ calls had an unwatched subtree.
 
 - `diff` is `null` for binary content and when the baseline could not be read
   (a `warnings` entry says so).
+- `diff` describes the **end state** of the call: a file written and then
+  restored before the command exits produces no change. Intermediate writes
+  within one call are not currently observable.
+- `path` is a UTF-8, workspace-relative path. Lossless handling of non-UTF-8
+  Unix filenames is still an open protocol issue and must not be assumed.
 - `diffTruncated` marks a diff clipped to 64 KiB. The full text is always in the
   CAS, keyed by `beforeSha` / `afterSha`.
 - `suspicious` means the file lost at least 80% of its content and was at least

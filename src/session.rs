@@ -10,6 +10,8 @@
 //!   still recoverable. This is what runs where user namespaces are blocked.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -54,6 +56,24 @@ pub struct Session {
     ledger: Ledger,
 }
 
+/// A session id becomes a directory name under the ledger root, so it may not
+/// navigate out of it. Without this, `--session ../../elsewhere` made the engine
+/// create and write a session outside its own ledger directory.
+fn validate_session_id(id: &str) -> Result<()> {
+    let rejected = id.is_empty()
+        || id == "."
+        || id == ".."
+        || id.contains('/')
+        || id.contains('\\')
+        || id.contains('\0');
+    if rejected {
+        return Err(Error::Invalid(format!(
+            "session id must be a single path component: {id:?}"
+        )));
+    }
+    Ok(())
+}
+
 pub fn default_ledger_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("WSBOX_HOME") {
         return PathBuf::from(dir);
@@ -73,6 +93,7 @@ impl Session {
     }
 
     pub fn open(params: &SessionOpenParams) -> Result<(Session, SessionOpenResult)> {
+        validate_session_id(&params.session)?;
         let capabilities = crate::capabilities::detect();
         let workspace = std::fs::canonicalize(&params.workspace)
             .map_err(|error| Error::io(&params.workspace, error))?;
@@ -143,6 +164,7 @@ impl Session {
     }
 
     pub fn load(ledger_dir: &Path, id: &str) -> Result<Session> {
+        validate_session_id(id)?;
         let root = Self::root_for(ledger_dir, id);
         if !root.exists() {
             return Err(Error::SessionNotFound(id.to_string()));
@@ -186,9 +208,13 @@ impl Session {
         }
     }
 
-    /// Does this path exist in the pre-session baseline?
-    fn baseline_has(&self, key: &str) -> bool {
-        self.baseline_path(key).exists()
+    /// Was this path a *directory* in the pre-session baseline?
+    ///
+    /// Existence is not enough: a file replaced by a directory has to be
+    /// reported, and `Path::is_dir` follows symlinks, so a link that happens to
+    /// point at a directory would be mistaken for one.
+    fn baseline_is_dir(&self, key: &str) -> bool {
+        is_real_dir(&self.baseline_path(key))
     }
 
     fn observe(&self) -> Result<Manifest> {
@@ -266,10 +292,8 @@ impl Session {
         self.save_index()?;
 
         let max_output = params.max_output_bytes.unwrap_or(64 * 1024) as usize;
-        let (stdout, stdout_bytes, stdout_spill) =
-            read_capped(&stdout_path, max_output, &call_dir, "stdout")?;
-        let (stderr, stderr_bytes, stderr_spill) =
-            read_capped(&stderr_path, max_output, &call_dir, "stderr")?;
+        let (stdout, stdout_bytes, stdout_spill) = read_capped(&stdout_path, max_output, "stdout")?;
+        let (stderr, stderr_bytes, stderr_spill) = read_capped(&stderr_path, max_output, "stderr")?;
 
         let ledger_changes: Vec<LedgerChange> = changes
             .iter()
@@ -340,9 +364,10 @@ impl Session {
 
             // Directories are structural. overlayfs materialises a directory in
             // `upper/` as soon as anything inside it is copied up, and that is
-            // not a change the caller asked for. A directory only counts when
-            // it does not exist in the baseline either.
-            if matches!(current.map(|e| e.kind), Some(Kind::Dir)) && self.baseline_has(key) {
+            // not a change the caller asked for — but only when the baseline had
+            // a directory there too. A file replaced by a directory is a real
+            // change and has to be reported.
+            if matches!(current.map(|e| e.kind), Some(Kind::Dir)) && self.baseline_is_dir(key) {
                 continue;
             }
             if matches!(previous.map(|e| e.kind), Some(Kind::Dir))
@@ -350,7 +375,12 @@ impl Session {
             {
                 continue;
             }
+            // Fast path: present on both sides with identical content *and*
+            // mode. Comparing the mode here matters — a pure `chmod` has the
+            // same bytes on both sides, so a content-only comparison would drop
+            // it before the state comparison below ever saw it.
             if let (Some(a), Some(b)) = (previous, current)
+                && a.mode == b.mode
                 && a.same_content(b)
             {
                 continue;
@@ -365,12 +395,11 @@ impl Session {
             // A rewrite that reproduces the previous bytes — including one that
             // copied a file up from the lower layer without changing it — is
             // not a change. Only a mode flip survives this check.
-            if before_state.exists == after_state.exists && before_state.sha == after_state.sha {
-                let mode_changed =
-                    matches!((previous, current), (Some(a), Some(b)) if a.mode != b.mode);
-                if !mode_changed {
-                    continue;
-                }
+            if before_state.exists == after_state.exists
+                && before_state.sha == after_state.sha
+                && before_state.mode == after_state.mode
+            {
+                continue;
             }
 
             let op = classify(&before_state, &after_state);
@@ -403,21 +432,42 @@ impl Session {
             }
 
             // Fold into the session index, preserving the first-touch baseline.
+            //
+            // The entry is kept even when the path is back at its baseline: the
+            // baseline blob is what `restore` and the audit surface need, and
+            // retention protects it by digest. `is_at_baseline` is what makes
+            // the *view* of the change set skip it, so a call that writes the
+            // original content back leaves no pending change — the per-call
+            // ledger entries still record both events.
             let existing = self.index.entries.get(key).cloned();
-            let (baseline_sha, baseline_exists) = match &existing {
-                Some(entry) => (entry.baseline_sha.clone(), entry.baseline_exists),
-                None => (before_state.sha.clone(), before_state.exists),
+            let (baseline_sha, baseline_exists, baseline_mode) = match &existing {
+                Some(entry) => (
+                    entry.baseline_sha.clone(),
+                    entry.baseline_exists,
+                    entry.baseline_mode,
+                ),
+                None => (
+                    before_state.sha.clone(),
+                    before_state.exists,
+                    before_state.mode,
+                ),
             };
             let mut ops = existing.as_ref().map(|e| e.ops.clone()).unwrap_or_default();
             ops.push(op);
 
+            // The cumulative change set describes the current state, not every
+            // state the path passed through. A call that writes the baseline
+            // content back therefore leaves nothing pending; the per-call ledger
+            // entries still preserve both events.
             self.index.entries.insert(
                 key.clone(),
                 IndexEntry {
                     baseline_sha,
                     baseline_exists,
+                    baseline_mode,
                     current_sha: after_state.sha.clone(),
                     current_exists: after_state.exists,
+                    current_mode: after_state.mode,
                     first_call: existing
                         .as_ref()
                         .map(|e| e.first_call.clone())
@@ -442,9 +492,12 @@ impl Session {
                 diff_truncated: truncated,
                 suspicious,
                 reason,
-                // An addition is reversible by deleting; everything else needs
-                // the baseline bytes.
-                reversible: before_state.content.is_some() || !before_state.exists,
+                // An addition is reversible by deleting; a directory deletion
+                // is reversible by recreating the directory over the lower
+                // layer; everything else needs the baseline bytes.
+                reversible: before_state.content.is_some()
+                    || !before_state.exists
+                    || before_state.mode.is_some_and(is_dir_mode),
             });
         }
 
@@ -472,6 +525,7 @@ impl Session {
                 exists: true,
                 bytes: Some(entry.size),
                 sha: entry.sha.clone(),
+                mode: Some(entry.mode),
                 content,
             });
         }
@@ -489,19 +543,33 @@ impl Session {
                 exists: indexed.current_exists,
                 bytes: content.as_ref().map(|bytes| bytes.len() as u64),
                 sha: indexed.current_sha.clone(),
+                mode: indexed.current_mode,
                 content,
             });
         }
 
         let path = self.baseline_path(key);
-        match fsutil::read_file(&path) {
-            Ok(content) => Ok(State {
+        let mode = mode_of(&path);
+        if is_real_dir(&path) {
+            return Ok(State {
+                exists: true,
+                bytes: None,
+                sha: None,
+                mode,
+                content: None,
+            });
+        }
+        match read_layer_content(&path) {
+            Ok(Some(content)) => Ok(State {
                 exists: true,
                 bytes: Some(content.len() as u64),
                 sha: Some(fsutil::hash_bytes(&content)),
+                mode,
                 content: Some(content),
             }),
-            Err(_) => Ok(State::absent()),
+            // Unreadable, or not a thing with content: treat it as absent, the
+            // same way an unreadable baseline has always been treated.
+            _ => Ok(State::absent()),
         }
     }
 
@@ -515,22 +583,26 @@ impl Session {
         };
         match entry.kind {
             Kind::Whiteout => Ok(State::absent()),
-            Kind::File => {
+            Kind::File | Kind::Symlink => {
                 let path = self.observation_path(key);
-                match fsutil::read_file(&path) {
-                    Ok(content) => Ok(State {
+                // A file that cannot be read is still a change: report it
+                // without a diff rather than failing the whole call.
+                match read_layer_content(&path) {
+                    Ok(Some(content)) => Ok(State {
                         exists: true,
                         bytes: Some(content.len() as u64),
                         sha: entry
                             .sha
                             .clone()
                             .or_else(|| Some(fsutil::hash_bytes(&content))),
+                        mode: Some(entry.mode),
                         content: Some(content),
                     }),
-                    Err(_) => Ok(State {
+                    Ok(None) | Err(_) => Ok(State {
                         exists: true,
                         bytes: Some(entry.size),
                         sha: entry.sha.clone(),
+                        mode: Some(entry.mode),
                         content: None,
                     }),
                 }
@@ -539,6 +611,7 @@ impl Session {
                 exists: true,
                 bytes: Some(entry.size),
                 sha: entry.sha.clone(),
+                mode: Some(entry.mode),
                 content: None,
             }),
         }
@@ -564,9 +637,6 @@ impl Session {
     /// is already present, so no file is read twice.
     fn persist_baseline(&self, manifest: &Manifest) -> Result<()> {
         for (key, entry) in manifest {
-            if entry.kind != Kind::File {
-                continue;
-            }
             let Some(sha) = &entry.sha else {
                 continue;
             };
@@ -574,8 +644,18 @@ impl Session {
                 continue;
             }
             let path = self.observation_path(key);
-            if path.is_file() {
-                self.cas.put_file(&path)?;
+            match entry.kind {
+                Kind::File if path.is_file() => {
+                    self.cas.put_file(&path)?;
+                }
+                // A symlink's target is its content, and the link itself is
+                // about to be replaced by whatever the command does.
+                Kind::Symlink => {
+                    if let Ok(target) = fsutil::read_link_bytes(&path) {
+                        self.cas.put_bytes(&target)?;
+                    }
+                }
+                _ => {}
             }
         }
         Ok(())
@@ -612,6 +692,9 @@ impl Session {
 
         let mut out = Vec::new();
         for (key, entry) in &self.index.entries {
+            if is_at_baseline(entry) {
+                continue;
+            }
             let before_content = match &entry.baseline_sha {
                 Some(sha) => self.cas.get(sha)?,
                 None => None,
@@ -909,7 +992,13 @@ impl Session {
         if self.meta.mode == Mode::Snapshot {
             return Ok(ApplyResult {
                 session: self.meta.id.clone(),
-                applied: self.index.entries.keys().cloned().collect(),
+                applied: self
+                    .index
+                    .entries
+                    .iter()
+                    .filter(|(_, entry)| !is_at_baseline(entry))
+                    .map(|(key, _)| key.clone())
+                    .collect(),
                 conflicts: Vec::new(),
                 ok: true,
             });
@@ -918,9 +1007,25 @@ impl Session {
         let mut conflicts = Vec::new();
         if !force {
             for (key, entry) in &self.index.entries {
+                // A path that is back at its baseline has nothing to write, so
+                // it cannot conflict either.
+                if is_at_baseline(entry) {
+                    continue;
+                }
                 let path = self.meta.workspace.join(key);
-                let current = fsutil::hash_file(&path).ok();
-                if current != entry.baseline_sha {
+                // Compare content, existence and mode. Hashing only bytes would
+                // miss a user `chmod` and then silently overwrite it. `hash_path`
+                // also treats a symlink's target as its content rather than
+                // hashing whatever the link currently resolves to.
+                let expected = (
+                    entry.baseline_exists,
+                    entry.baseline_sha.clone(),
+                    entry.baseline_mode,
+                );
+                let unchanged = path_identity(&path)
+                    .map(|current| current == expected)
+                    .unwrap_or(false);
+                if !unchanged {
                     conflicts.push(key.clone());
                 }
             }
@@ -936,24 +1041,47 @@ impl Session {
 
         let mut applied = Vec::new();
         for (key, entry) in &self.index.entries {
+            if is_at_baseline(entry) {
+                continue;
+            }
             let target = self.meta.workspace.join(key);
             if entry.current_exists {
                 let Some(sha) = entry.current_sha.clone() else {
-                    // No digest means no content: a directory, or another
-                    // structural entry. Reproduce it as a directory.
-                    if self.observation_path(key).is_dir() {
+                    // No digest means no content. A directory is reproduced as
+                    // a directory; a fifo is reproduced as a fifo; anything
+                    // else (a socket, a device node) is a change the engine
+                    // reports but cannot write back, and saying so is the only
+                    // honest answer — silently skipping it made `apply` claim
+                    // success for a change set it did not apply.
+                    let source = self.observation_path(key);
+                    let mode = entry.current_mode.or_else(|| mode_of(&source));
+                    if is_real_dir(&source) {
+                        // A baseline file can be replaced by a directory. Remove
+                        // the old leaf first; an existing directory is left in
+                        // place so applying into it stays incremental.
+                        if std::fs::symlink_metadata(&target).is_ok() && !is_real_dir(&target) {
+                            fsutil::remove_tree(&target)?;
+                        }
                         fsutil::ensure_dir(&target)?;
                         applied.push(key.clone());
+                    } else if mode.is_some_and(is_fifo_mode) {
+                        create_fifo(&target, mode)?;
+                        applied.push(key.clone());
+                    } else {
+                        return Err(Error::Unsupported(format!(
+                            "{key} is not a regular file, directory, symlink or fifo; \
+                             it is recorded in the ledger but cannot be applied"
+                        )));
                     }
                     continue;
                 };
-                if !self.cas.export(&sha, &target)? {
+                if !self.materialize(&sha, entry.current_mode, &target)? {
                     return Err(Error::Invalid(format!(
                         "content for {key} ({sha}) is missing from the CAS"
                     )));
                 }
             } else {
-                let _ = std::fs::remove_file(&target);
+                fsutil::remove_tree(&target)?;
             }
             applied.push(key.clone());
         }
@@ -969,7 +1097,7 @@ impl Session {
     /// Put files back to their session baseline. In overlay mode this rewrites
     /// `upper/`; in snapshot mode it rewrites the workspace.
     pub fn restore(&mut self, path: Option<&str>, all: bool) -> Result<Vec<String>> {
-        let keys: Vec<String> = if all {
+        let mut keys: Vec<String> = if all {
             self.index.entries.keys().cloned().collect()
         } else {
             let key = fsutil::relative_key(
@@ -977,6 +1105,9 @@ impl Session {
             )?;
             vec![key]
         };
+        // Restore children before parents. A forward pass removes a directory
+        // before its contents and leaves an empty tree behind.
+        keys.sort_by(|a, b| path_depth(b).cmp(&path_depth(a)).then_with(|| b.cmp(a)));
 
         let mut restored = Vec::new();
         for key in keys {
@@ -990,22 +1121,25 @@ impl Session {
 
             if entry.baseline_exists {
                 let Some(sha) = entry.baseline_sha.clone() else {
-                    // Baseline had no content: a directory.
+                    // Baseline had no content: a directory. It may have been
+                    // replaced by a file or symlink, so clear that leaf first.
+                    if std::fs::symlink_metadata(&target).is_ok() && !is_real_dir(&target) {
+                        fsutil::remove_tree(&target)?;
+                    }
                     let _ = std::fs::create_dir_all(&target);
                     self.index.entries.remove(&key);
                     restored.push(key);
                     continue;
                 };
-                if !self.cas.export(&sha, &target)? {
+                if !self.materialize(&sha, entry.baseline_mode, &target)? {
                     return Err(Error::Invalid(format!(
                         "baseline for {key} is missing from the CAS"
                     )));
                 }
             } else {
-                // Removing a directory only works once it is empty; files
-                // inside it are restored by their own index entries.
-                let _ = std::fs::remove_file(&target);
-                let _ = std::fs::remove_dir(&target);
+                // Children have already been restored/removed, so this is now
+                // either a leaf or an empty directory.
+                fsutil::remove_tree(&target)?;
             }
 
             self.index.entries.remove(&key);
@@ -1014,6 +1148,41 @@ impl Session {
 
         self.save_index()?;
         Ok(restored)
+    }
+
+    /// Reproduce one recorded state at `target`, from the CAS.
+    ///
+    /// `mode` is that state's `st_mode`. It is what tells a symlink from a
+    /// regular file and what carries the permission bits, so a mode-only change
+    /// is reproducible from the index rather than from whatever the path looks
+    /// like now — the difference between `restore` working after `apply` and
+    /// only working before it.
+    fn materialize(&self, sha: &str, mode: Option<u32>, target: &Path) -> Result<bool> {
+        if mode.is_some_and(is_symlink_mode) {
+            let Some(target_bytes) = self.cas.get(sha)? else {
+                return Ok(false);
+            };
+            let parent = target.parent().unwrap_or_else(|| Path::new("."));
+            fsutil::ensure_dir(parent)?;
+            let temp = parent.join(format!(".wsbox-link-{}", std::process::id()));
+            let _ = std::fs::remove_file(&temp);
+            std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(&target_bytes), &temp)
+                .map_err(|error| Error::io(&temp, error))?;
+            fsutil::remove_tree(target)?;
+            std::fs::rename(&temp, target).map_err(|error| Error::io(target, error))?;
+            return Ok(true);
+        }
+
+        if !self.cas.export(sha, target)? {
+            return Ok(false);
+        }
+        // `export` carries the blob's permissions, which are not the file's:
+        // the blob is a CAS artefact, not the workspace entry.
+        if let Some(mode) = mode {
+            let _ =
+                std::fs::set_permissions(target, std::fs::Permissions::from_mode(mode & 0o7777));
+        }
+        Ok(true)
     }
 }
 
@@ -1059,6 +1228,9 @@ struct State {
     exists: bool,
     bytes: Option<u64>,
     sha: Option<String>,
+    /// Full `st_mode`, so a symlink is distinguishable from a regular file and a
+    /// mode-only change is visible even when the bytes are identical.
+    mode: Option<u32>,
     content: Option<Vec<u8>>,
 }
 
@@ -1068,17 +1240,139 @@ impl State {
             exists: false,
             bytes: None,
             sha: None,
+            mode: None,
             content: None,
         }
     }
+}
+
+/// Read a path in the baseline/observation layer, treating a symlink's target
+/// as its content.
+///
+/// A symlink is not followed: the journal records what the link *says*, which is
+/// what makes retargeting it a change and what makes it reproducible. Anything
+/// that is neither a regular file nor a symlink (a fifo, a device, a directory)
+/// has no content.
+fn read_layer_content(path: &Path) -> Result<Option<Vec<u8>>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            Ok(Some(fsutil::read_link_bytes(path)?))
+        }
+        Ok(metadata) if metadata.is_file() => Ok(Some(fsutil::read_file(path)?)),
+        Ok(_) => Ok(None),
+        Err(_) => Ok(None),
+    }
+}
+
+/// True when the path's current state is its baseline state, so nothing is
+/// pending: there is nothing for `apply` to write and nothing for the change
+/// set to show.
+fn is_at_baseline(entry: &IndexEntry) -> bool {
+    entry.baseline_exists == entry.current_exists
+        && entry.baseline_sha == entry.current_sha
+        && entry.baseline_mode == entry.current_mode
+}
+
+fn mode_of(path: &Path) -> Option<u32> {
+    std::fs::symlink_metadata(path).ok().map(|meta| meta.mode())
+}
+
+/// True when the path itself is a directory — a symlink that resolves to one is
+/// not, because the change set is about the entry, not what it points at.
+fn is_real_dir(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir())
+}
+
+/// Existence, content digest and full mode for conflict detection.
+///
+/// Unlike `hash_path`, this also represents directories and absence, so
+/// replacing a file with a directory (or vice versa) is a conflict rather than
+/// an accidental match on `None`.
+fn path_identity(path: &Path) -> Result<(bool, Option<String>, Option<u32>)> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            let sha = if metadata.file_type().is_symlink() || metadata.is_file() {
+                Some(fsutil::hash_path(path)?)
+            } else {
+                None
+            };
+            Ok((true, sha, Some(metadata.mode())))
+        }
+        // `NotADirectory` is the same fact as `NotFound` seen from below: an
+        // ancestor is a file, so this path cannot exist. Treating it as an
+        // error would report a conflict for every child of a file that the
+        // session turned into a directory.
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok((false, None, None))
+        }
+        Err(error) => Err(Error::io(path, error)),
+    }
+}
+
+fn path_depth(key: &str) -> usize {
+    key.split('/')
+        .filter(|component| !component.is_empty())
+        .count()
+}
+
+/// `st_mode` carries the file type in its high bits; a symlink is one of those
+/// types, not a file with unusual permissions.
+fn is_symlink_mode(mode: u32) -> bool {
+    mode & libc::S_IFMT == libc::S_IFLNK
+}
+
+fn is_dir_mode(mode: u32) -> bool {
+    mode & libc::S_IFMT == libc::S_IFDIR
+}
+
+fn is_fifo_mode(mode: u32) -> bool {
+    mode & libc::S_IFMT == libc::S_IFIFO
+}
+
+/// Create a fifo, replacing whatever is at the path.
+///
+/// A fifo has no content, so it cannot go through the CAS — but it is a real
+/// file a build script may create, and "reported but not applied" is worse than
+/// either outcome.
+fn create_fifo(target: &Path, mode: Option<u32>) -> Result<()> {
+    let parent = target.parent().unwrap_or_else(|| Path::new("."));
+    fsutil::ensure_dir(parent)?;
+    if std::fs::symlink_metadata(target).is_ok() {
+        fsutil::remove_tree(target)?;
+    }
+    let temp = parent.join(format!(".wsbox-fifo-{}", std::process::id()));
+    let _ = std::fs::remove_file(&temp);
+    let permissions = mode.unwrap_or(0o644) & 0o7777;
+    let path = std::ffi::CString::new(temp.as_os_str().as_bytes())
+        .map_err(|_| Error::Invalid(format!("path contains a NUL byte: {}", temp.display())))?;
+    if unsafe { libc::mkfifo(path.as_ptr(), permissions) } != 0 {
+        return Err(Error::io(&temp, std::io::Error::last_os_error()));
+    }
+    std::fs::rename(&temp, target).map_err(|error| Error::io(target, error))?;
+    Ok(())
 }
 
 fn classify(before: &State, after: &State) -> Op {
     match (before.exists, after.exists) {
         (false, true) => Op::Add,
         (true, false) => Op::Delete,
-        (true, true) if before.sha == after.sha => Op::Chmod,
+        (true, true) if before.sha == after.sha && same_file_type(before.mode, after.mode) => {
+            Op::Chmod
+        }
         _ => Op::Modify,
+    }
+}
+
+/// Compare only the file-type bits of `st_mode`, leaving permissions out.
+fn same_file_type(before: Option<u32>, after: Option<u32>) -> bool {
+    match (before, after) {
+        (Some(before), Some(after)) => before & libc::S_IFMT == after & libc::S_IFMT,
+        _ => true,
     }
 }
 
@@ -1133,10 +1427,14 @@ fn mode_name(mode: Mode) -> &'static str {
 
 /// Read a captured stream, capping what goes back inline and always leaving the
 /// full text on disk.
+///
+/// The `spill` path returned for a truncated stream is the capture file itself
+/// (`calls/<id>/stdout.txt`), which is where the command's output was written
+/// and where the notice above points. It used to name a `stdout.full.txt` that
+/// nothing ever created.
 fn read_capped(
     path: &Path,
     max_bytes: usize,
-    call_dir: &Path,
     name: &str,
 ) -> Result<(String, u64, Option<PathBuf>)> {
     let bytes = match std::fs::read(path) {
@@ -1149,18 +1447,19 @@ fn read_capped(
         return Ok((String::from_utf8_lossy(&bytes).to_string(), total, None));
     }
 
+    // Keep both ends: the first line of an error is usually the point, and so
+    // is the last.
     let head = max_bytes * 7 / 10;
     let tail = max_bytes - head;
     let mut text = String::new();
     text.push_str(&String::from_utf8_lossy(&bytes[..head]));
     text.push_str(&format!(
-        "\n[... {} bytes omitted; full output at {} ...]\n",
+        "\n[... {} bytes of {name} omitted; full output at {} ...]\n",
         total as usize - max_bytes,
         path.display()
     ));
     text.push_str(&String::from_utf8_lossy(&bytes[bytes.len() - tail..]));
-    let spill = call_dir.join(format!("{name}.full.txt"));
-    Ok((text, total, Some(spill)))
+    Ok((text, total, Some(path.to_path_buf())))
 }
 
 /// Keep call ids usable as directory names.
@@ -1203,54 +1502,86 @@ mod tests {
         assert_eq!(assess_shrink(&Some(8192), &Some(7000)), (false, None));
     }
 
+    /// One side of a comparison, with the fields these tests care about set.
+    fn state(exists: bool, sha: Option<&str>, bytes: Option<u64>, mode: u32) -> State {
+        State {
+            exists,
+            bytes,
+            sha: sha.map(str::to_string),
+            mode: Some(mode),
+            content: None,
+        }
+    }
+
     #[test]
     fn additions_are_classified_as_add() {
-        let after = State {
-            exists: true,
-            bytes: Some(1),
-            sha: Some("x".into()),
-            content: None,
-        };
+        let after = state(true, Some("x"), Some(1), 0o100644);
         assert_eq!(classify(&State::absent(), &after), Op::Add);
     }
 
     #[test]
     fn whiteout_is_classified_as_delete() {
-        let before = State {
-            exists: true,
-            bytes: Some(10),
-            sha: Some("x".into()),
-            content: None,
-        };
+        let before = state(true, Some("x"), Some(10), 0o100644);
         assert_eq!(classify(&before, &State::absent()), Op::Delete);
     }
 
+    /// `classify` sees identical content, which is what a chmod looks like once
+    /// the mode comparison upstream has decided it is a real change.
     #[test]
     fn identical_content_is_a_mode_change() {
-        let before = State {
-            exists: true,
-            bytes: Some(10),
-            sha: Some("x".into()),
-            content: None,
-        };
-        let after = before.clone();
+        let before = state(true, Some("x"), Some(10), 0o100644);
+        let after = state(true, Some("x"), Some(10), 0o100755);
         assert_eq!(classify(&before, &after), Op::Chmod);
     }
 
     #[test]
     fn different_content_is_a_modify() {
-        let before = State {
-            exists: true,
-            bytes: Some(10),
-            sha: Some("x".into()),
-            content: None,
-        };
-        let after = State {
-            exists: true,
-            bytes: Some(0),
-            sha: Some("y".into()),
-            content: None,
-        };
+        let before = state(true, Some("x"), Some(10), 0o100644);
+        let after = state(true, Some("y"), Some(0), 0o100644);
         assert_eq!(classify(&before, &after), Op::Modify);
+    }
+
+    #[test]
+    fn symlink_mode_is_recognised() {
+        assert!(is_symlink_mode(libc::S_IFLNK | 0o777));
+        assert!(!is_symlink_mode(libc::S_IFREG | 0o644));
+        assert!(is_fifo_mode(libc::S_IFIFO | 0o644));
+        assert!(!is_fifo_mode(libc::S_IFREG | 0o644));
+    }
+
+    /// A session id is a directory name under the ledger root; anything that
+    /// navigates out of it used to create a session outside the ledger.
+    #[test]
+    fn a_session_id_may_not_escape_the_ledger_directory() {
+        assert!(validate_session_id("s1").is_ok());
+        assert!(validate_session_id("sess_7f3a").is_ok());
+        for bad in ["", ".", "..", "../x", "a/b", "a\\b", "s1\0"] {
+            assert!(
+                validate_session_id(bad).is_err(),
+                "{bad:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn a_path_at_its_baseline_is_not_pending() {
+        let mut entry = IndexEntry {
+            baseline_sha: Some("a".into()),
+            baseline_exists: true,
+            baseline_mode: Some(0o100644),
+            current_sha: Some("a".into()),
+            current_exists: true,
+            current_mode: Some(0o100644),
+            first_call: "c1".into(),
+            last_call: "c2".into(),
+            ops: vec![Op::Modify],
+        };
+        assert!(is_at_baseline(&entry));
+
+        entry.current_mode = Some(0o100755);
+        assert!(!is_at_baseline(&entry), "a mode flip is still pending");
+        entry.current_mode = Some(0o100644);
+        entry.current_sha = Some("b".into());
+        assert!(!is_at_baseline(&entry));
     }
 }

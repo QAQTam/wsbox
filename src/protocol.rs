@@ -288,6 +288,8 @@ pub struct ExecResult {
     pub stderr: String,
     pub stdout_bytes: u64,
     pub stderr_bytes: u64,
+    /// Where the uncapped stream lives on disk. `Some` when the inline text was
+    /// truncated; the file itself always exists under the session directory.
     pub stdout_spill: Option<PathBuf>,
     pub stderr_spill: Option<PathBuf>,
     pub ledger_ref: String,
@@ -380,6 +382,16 @@ pub struct IndexEntry {
     /// State after the most recent call that touched it.
     pub current_sha: Option<String>,
     pub current_exists: bool,
+    /// Full `st_mode` (file type plus permission bits) of each side.
+    ///
+    /// Recorded rather than inferred, for two reasons: a mode-only change has
+    /// no content difference to reproduce it from, and a symlink has to be
+    /// recreated as a symlink instead of as a file holding its target. Absent in
+    /// indexes written before this field existed.
+    #[serde(default)]
+    pub baseline_mode: Option<u32>,
+    #[serde(default)]
+    pub current_mode: Option<u32>,
     pub first_call: String,
     pub last_call: String,
     pub ops: Vec<Op>,

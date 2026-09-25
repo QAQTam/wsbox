@@ -5,10 +5,11 @@
 //! the capability probe *agrees* with reality and skip with a printed reason —
 //! a test that cannot fail is worse than no test.
 
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 
 use tempfile::TempDir;
-use wsbox::protocol::{ExecParams, LedgerQueryParams, Mode, Network, SessionOpenParams, Spec};
+use wsbox::protocol::{ExecParams, LedgerQueryParams, Mode, Network, Op, SessionOpenParams, Spec};
 use wsbox::session::Session;
 
 struct Fixture {
@@ -211,6 +212,247 @@ fn atomic_rename_is_one_modify() {
             .unwrap()
             .contains("+after")
     );
+}
+
+/// Size and mtime are not the signal; content is. A same-size rewrite must
+/// still produce a line-level diff.
+#[test]
+fn same_size_rewrite_is_reported_with_a_diff() {
+    if !overlay_available() {
+        skip("overlayfs unavailable in a user namespace");
+        return;
+    }
+
+    let fixture = Fixture::new();
+    fixture.write("same.txt", "aaaa\n");
+
+    let mut session = fixture.open("same-size", Mode::Overlay);
+    let result = exec(&mut session, "call-1", "printf 'bbbb\\n' > same.txt");
+
+    assert_eq!(result.changes.len(), 1, "{:?}", result.changes);
+    let change = &result.changes[0];
+    assert_eq!(change.before_bytes, Some(5));
+    assert_eq!(change.after_bytes, Some(5));
+    let diff = change.diff.as_deref().expect("a textual diff");
+    assert!(diff.contains("-aaaa"), "{diff}");
+    assert!(diff.contains("+bbbb"), "{diff}");
+}
+
+/// Binary changes still belong in the change set even though there is no
+/// textual diff to render.
+#[test]
+fn binary_change_is_reported_without_a_text_diff() {
+    if !overlay_available() {
+        skip("overlayfs unavailable in a user namespace");
+        return;
+    }
+
+    let fixture = Fixture::new();
+    std::fs::write(fixture.path("blob.bin"), [0xff, 0xfe, 0xfd, 0xfc]).expect("binary fixture");
+
+    let mut session = fixture.open("binary", Mode::Overlay);
+    let result = exec(
+        &mut session,
+        "call-1",
+        "printf '\\377\\376\\375' > blob.bin",
+    );
+
+    assert_eq!(result.changes.len(), 1, "{:?}", result.changes);
+    let change = &result.changes[0];
+    assert_eq!(change.op, Op::Modify);
+    assert_eq!(change.before_bytes, Some(4));
+    assert_eq!(change.after_bytes, Some(3));
+    assert!(change.diff.is_none(), "binary content has no text diff");
+    assert_ne!(change.before_sha, change.after_sha);
+}
+
+/// A call that returns a path to its baseline state leaves no cumulative
+/// change behind. The ledger still records both calls; the session view is the
+/// current state, not the union of every transient edit.
+#[test]
+fn returning_to_the_baseline_clears_the_cumulative_change() {
+    if !overlay_available() {
+        skip("overlayfs unavailable in a user namespace");
+        return;
+    }
+
+    let fixture = Fixture::new();
+    fixture.write("a.txt", "original\n");
+
+    let mut session = fixture.open("revert-to-baseline", Mode::Overlay);
+    exec(&mut session, "call-1", "echo changed > a.txt");
+    assert_eq!(session.changes().expect("first changes").len(), 1);
+
+    let result = exec(&mut session, "call-2", "printf 'original\\n' > a.txt");
+    assert_eq!(result.changes.len(), 1, "call 2 did change the file");
+    assert!(
+        session.changes().expect("final changes").is_empty(),
+        "a final state equal to the baseline is not a pending change"
+    );
+}
+
+/// A user permission change during the session must conflict just like a
+/// content edit. Hashing only bytes would silently overwrite it.
+#[test]
+fn apply_aborts_on_a_user_mode_conflict() {
+    if !overlay_available() {
+        skip("overlayfs unavailable in a user namespace");
+        return;
+    }
+
+    let fixture = Fixture::new();
+    fixture.write("script.sh", "#!/bin/sh\necho hi\n");
+    let script = fixture.path("script.sh");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o644)).expect("chmod 644");
+
+    let mut session = fixture.open("mode-conflict", Mode::Overlay);
+    exec(&mut session, "call-1", "chmod 755 script.sh");
+
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o600))
+        .expect("user chmod 600");
+
+    let applied = session.apply(false).expect("apply");
+    assert!(!applied.ok, "a mode conflict must abort apply");
+    assert_eq!(applied.conflicts, vec!["script.sh"]);
+    assert_eq!(
+        std::fs::metadata(&script).expect("stat").mode() & 0o7777,
+        0o600,
+        "the user's mode must survive"
+    );
+}
+
+/// Replacing a file with a directory is a modify, not a permission change,
+/// even when the symlink target and the old file happen to have the same bytes.
+#[test]
+fn file_to_symlink_with_equal_bytes_is_a_modify() {
+    if !overlay_available() {
+        skip("overlayfs unavailable in a user namespace");
+        return;
+    }
+
+    let fixture = Fixture::new();
+    fixture.write("path", "target");
+
+    let mut session = fixture.open("type-change", Mode::Overlay);
+    let result = exec(&mut session, "call-1", "ln -sfn target path");
+
+    assert_eq!(result.changes.len(), 1, "{:?}", result.changes);
+    assert_eq!(
+        result.changes[0].op,
+        Op::Modify,
+        "the file type changed even though the content digest did not"
+    );
+    assert_eq!(result.changes[0].before_sha, result.changes[0].after_sha);
+}
+
+/// `apply` has to replace the path itself, not try to create a directory where
+/// a regular file still exists.
+#[test]
+fn apply_replaces_a_file_with_a_directory() {
+    if !overlay_available() {
+        skip("overlayfs unavailable in a user namespace");
+        return;
+    }
+
+    let fixture = Fixture::new();
+    fixture.write("node", "old\n");
+
+    let mut session = fixture.open("apply-file-to-dir", Mode::Overlay);
+    exec(
+        &mut session,
+        "call-1",
+        "rm node && mkdir node && printf 'inner\\n' > node/file.txt",
+    );
+
+    let applied = session.apply(false).expect("apply");
+    assert!(applied.ok, "{:?}", applied.conflicts);
+    assert!(fixture.path("node").is_dir());
+    assert_eq!(fixture.read("node/file.txt"), "inner\n");
+}
+
+/// Restoring a tree added by the session must remove the directories after
+/// removing their children; a single forward pass leaves empty directories
+/// behind that the next call would report as new again.
+#[test]
+fn restore_removes_an_added_directory_tree() {
+    if !overlay_available() {
+        skip("overlayfs unavailable in a user namespace");
+        return;
+    }
+
+    let fixture = Fixture::new();
+    fixture.write("keep.txt", "keep\n");
+
+    let mut session = fixture.open("restore-added-tree", Mode::Overlay);
+    exec(
+        &mut session,
+        "call-1",
+        "mkdir -p nested/deep && printf 'x\\n' > nested/deep/file.txt",
+    );
+
+    session.restore(None, true).expect("restore all");
+    assert!(
+        !session.root.join("upper/nested").exists(),
+        "the added directory tree must be removed from the session view"
+    );
+    assert!(session.changes().expect("changes").is_empty());
+}
+
+/// Restoring a file that the session replaced with a directory must remove the
+/// directory tree before materialising the baseline file.
+#[test]
+fn restore_replaces_a_directory_with_its_baseline_file() {
+    if !overlay_available() {
+        skip("overlayfs unavailable in a user namespace");
+        return;
+    }
+
+    let fixture = Fixture::new();
+    fixture.write("path", "baseline\n");
+
+    let mut session = fixture.open("restore-file-from-dir", Mode::Overlay);
+    exec(
+        &mut session,
+        "call-1",
+        "rm path && mkdir path && printf 'inner\\n' > path/file.txt",
+    );
+
+    session.restore(None, true).expect("restore all");
+    assert_eq!(
+        std::fs::read_to_string(session.root.join("upper/path")).expect("restored file"),
+        "baseline\n"
+    );
+    assert!(session.changes().expect("changes").is_empty());
+}
+
+/// On Unix, backslash is an ordinary filename byte, not a separator. Replacing
+/// it with `/` invents a path that does not exist and makes `apply` fail.
+#[test]
+fn a_backslash_in_a_filename_is_not_a_directory_separator() {
+    if !overlay_available() {
+        skip("overlayfs unavailable in a user namespace");
+        return;
+    }
+
+    let fixture = Fixture::new();
+    fixture.write("keep.txt", "keep\n");
+
+    let mut session = fixture.open("backslash-path", Mode::Overlay);
+    let result = exec(&mut session, "call-1", r#"printf 'x\n' > 'back\slash.txt'"#);
+
+    assert_eq!(result.changes.len(), 1, "{:?}", result.changes);
+    assert_eq!(result.changes[0].path, r"back\slash.txt");
+    assert!(
+        result.changes[0]
+            .diff
+            .as_deref()
+            .is_some_and(|diff| diff.contains("+x")),
+        "the invented path has no content to diff"
+    );
+
+    let applied = session.apply(false).expect("apply");
+    assert!(applied.ok, "{:?}", applied.conflicts);
+    assert_eq!(fixture.read(r"back\slash.txt"), "x\n");
 }
 
 /* ------------------------------ session flow ---------------------------- */
@@ -748,6 +990,57 @@ fn passthrough_outside_the_workspace_is_rejected() {
     );
 }
 
+/// `--passthrough ../elsewhere` is the same escape with a relative path: the
+/// joined result is lexically inside the workspace and really outside it. It
+/// must be refused *before* the directory is created, or the check itself
+/// leaves a footprint outside the workspace.
+#[test]
+fn passthrough_cannot_escape_with_a_parent_dir() {
+    if !overlay_available() {
+        skip("overlayfs unavailable in a user namespace");
+        return;
+    }
+
+    let fixture = Fixture::new();
+    fixture.write("a.txt", "one\n");
+    let mut session = fixture.open("passthrough-parent", Mode::Overlay);
+
+    // Resolved exactly the way the CLI resolves a relative --passthrough.
+    let unique = fixture
+        .ledger
+        .path()
+        .file_name()
+        .expect("ledger dir name")
+        .to_string_lossy()
+        .to_string();
+    let escape = session
+        .meta
+        .workspace
+        .join(format!("../wsbox-escape-{unique}"));
+    let result = session.exec(&ExecParams {
+        session: session.meta.id.clone(),
+        call: "call-1".into(),
+        cwd: session.meta.workspace.clone(),
+        argv: vec!["true".into()],
+        spec: Spec {
+            enabled: true,
+            writable_roots: vec![session.meta.workspace.clone()],
+            passthrough: vec![escape.clone()],
+            network: Network::Deny,
+            ..Spec::default()
+        },
+        ledger_dir: None,
+        timeout_ms: Some(10_000),
+        max_output_bytes: None,
+    });
+
+    assert!(result.is_err(), "`..` in a passthrough must be refused");
+    assert!(
+        !escape.exists(),
+        "a refused passthrough must not create the directory it named"
+    );
+}
+
 #[test]
 fn git_cannot_be_a_passthrough_path() {
     if !overlay_available() {
@@ -780,6 +1073,69 @@ fn git_cannot_be_a_passthrough_path() {
     assert!(
         result.is_err(),
         "`.git` must never bypass the journal, or history can be rewritten unseen"
+    );
+}
+
+/// A fifo is a real file a build script may create. Reporting it and then
+/// silently not applying it made `apply` claim success for a change it had not
+/// made.
+#[test]
+fn a_fifo_is_applied_as_a_fifo() {
+    if !overlay_available() {
+        skip("overlayfs unavailable in a user namespace");
+        return;
+    }
+
+    let fixture = Fixture::new();
+    fixture.write("a.txt", "one\n");
+    let mut session = fixture.open("fifo", Mode::Overlay);
+
+    let result = exec(&mut session, "call-1", "mkfifo pipe");
+    assert_eq!(result.changes.len(), 1);
+    assert_eq!(result.changes[0].path, "pipe");
+
+    let applied = session.apply(false).expect("apply");
+    assert!(applied.ok, "{:?}", applied.conflicts);
+    let metadata = std::fs::symlink_metadata(fixture.path("pipe")).expect("the fifo exists");
+    assert!(
+        metadata.file_type().is_fifo(),
+        "apply must create a fifo, not a regular file"
+    );
+}
+
+/// A session id becomes a directory name under the ledger root, so it must not
+/// be able to navigate out of it.
+#[test]
+fn a_session_id_cannot_escape_the_ledger_directory() {
+    let fixture = Fixture::new();
+    fixture.write("a.txt", "one\n");
+    let unique = fixture
+        .ledger
+        .path()
+        .file_name()
+        .expect("ledger dir name")
+        .to_string_lossy()
+        .to_string();
+    let escaped = format!("wsbox-escape-{unique}");
+
+    let result = Session::open(&SessionOpenParams {
+        session: format!("../../{escaped}"),
+        workspace: fixture.workspace.path().to_path_buf(),
+        ledger_dir: Some(fixture.ledger.path().to_path_buf()),
+        mode: Mode::Snapshot,
+        copy_mode: Default::default(),
+    });
+
+    assert!(result.is_err(), "a session id must not escape the ledger");
+    assert!(
+        !fixture
+            .ledger
+            .path()
+            .parent()
+            .expect("ledger parent")
+            .join(&escaped)
+            .exists(),
+        "a rejected session id must not create anything"
     );
 }
 
@@ -830,6 +1186,66 @@ fn a_new_directory_is_applied() {
     let applied = session.apply(false).expect("apply");
     assert!(applied.ok, "{:?}", applied.conflicts);
     assert_eq!(fixture.read("nested/deep/b.txt"), "x\n");
+}
+
+/// Deleting an existing directory produces a whiteout for the directory itself,
+/// not individual entries for files the overlay never copied up. The baseline
+/// side therefore has to represent directories as existing states, or `rm -rf`
+/// silently produces no change at all.
+#[test]
+fn deleting_a_directory_is_reported_and_applied() {
+    if !overlay_available() {
+        skip("overlayfs unavailable in a user namespace");
+        return;
+    }
+
+    let fixture = Fixture::new();
+    fixture.write("nested/deep/file.txt", "x\n");
+
+    let mut session = fixture.open("delete-dir", Mode::Overlay);
+    let result = exec(&mut session, "call-1", "rm -rf nested");
+
+    assert_eq!(result.exit_code, 0, "{}", result.stderr);
+    let change = result
+        .changes
+        .iter()
+        .find(|change| change.path == "nested")
+        .unwrap_or_else(|| panic!("directory deletion missing from {:?}", result.changes));
+    assert_eq!(change.op, Op::Delete);
+    assert!(change.reversible, "the lower directory must be restorable");
+
+    let applied = session.apply(false).expect("apply");
+    assert!(applied.ok, "{:?}", applied.conflicts);
+    assert!(
+        !fixture.path("nested").exists(),
+        "apply must remove the directory, not just its tracked children"
+    );
+}
+
+/// A baseline file replaced by an *empty* directory has no child file whose
+/// addition can implicitly recreate the directory. The directory transition
+/// itself has to be a reported change.
+#[test]
+fn replacing_a_file_with_an_empty_directory_is_reported() {
+    if !overlay_available() {
+        skip("overlayfs unavailable in a user namespace");
+        return;
+    }
+
+    let fixture = Fixture::new();
+    fixture.write("node", "old\n");
+
+    let mut session = fixture.open("empty-file-to-dir", Mode::Overlay);
+    let result = exec(&mut session, "call-1", "rm node && mkdir node");
+
+    assert_eq!(result.exit_code, 0, "{}", result.stderr);
+    assert_eq!(result.changes.len(), 1, "{:?}", result.changes);
+    assert_eq!(result.changes[0].path, "node");
+    assert_eq!(result.changes[0].op, Op::Modify);
+
+    let applied = session.apply(false).expect("apply");
+    assert!(applied.ok, "{:?}", applied.conflicts);
+    assert!(fixture.path("node").is_dir());
 }
 
 /* ------------------------------ degraded mode --------------------------- */
@@ -920,4 +1336,341 @@ fn path_escapes_are_rejected() {
     assert!(wsbox::fsutil::relative_key("../../etc/passwd").is_err());
     assert!(wsbox::fsutil::relative_key("/etc/passwd").is_err());
     assert!(wsbox::fsutil::relative_key("src/main.rs").is_ok());
+}
+
+/* ------------------------------ output capture -------------------------- */
+
+/// A capped stream must point at a file that exists and holds the full output.
+#[test]
+fn a_truncated_stream_spills_to_a_real_file() {
+    let fixture = Fixture::new();
+    fixture.write("a.txt", "one\n");
+    let mut session = fixture.open("spill", Mode::Snapshot);
+
+    let result = session
+        .exec(&ExecParams {
+            session: session.meta.id.clone(),
+            call: "call-1".into(),
+            cwd: session.meta.workspace.clone(),
+            argv: vec![
+                "bash".into(),
+                "-lc".into(),
+                "python3 -c \"import sys; sys.stdout.write('x' * 4000)\"".into(),
+            ],
+            // No sandbox: this test is about the capture, not the isolation.
+            spec: Spec {
+                enabled: false,
+                ..Spec::default()
+            },
+            ledger_dir: None,
+            timeout_ms: Some(30_000),
+            max_output_bytes: Some(1024),
+        })
+        .expect("exec");
+
+    assert_eq!(result.stdout_bytes, 4000, "the real byte count is reported");
+    assert!(
+        result.stdout.contains("omitted"),
+        "the inline text says it was capped"
+    );
+
+    let spill = result
+        .stdout_spill
+        .clone()
+        .expect("a capped stream has a spill path");
+    assert!(
+        spill.is_file(),
+        "the spill path must exist: {}",
+        spill.display()
+    );
+    let full = std::fs::read(&spill).expect("read the spill file");
+    assert_eq!(full.len() as u64, result.stdout_bytes);
+    assert!(
+        result.stdout.len() < full.len(),
+        "the inline copy must be shorter than the file"
+    );
+}
+
+/// A command is free to exit 125 — plenty do. Treating that as a sandbox setup
+/// failure discarded the entire change set of a command that had already
+/// written to the workspace, which is the exact failure mode this engine
+/// exists to prevent.
+#[test]
+fn a_command_exiting_125_still_reports_its_changes() {
+    let fixture = Fixture::new();
+    fixture.write("a.txt", "one\n");
+    let mut session = fixture.open("exit-125", Mode::Snapshot);
+
+    let result = session
+        .exec(&ExecParams {
+            session: session.meta.id.clone(),
+            call: "call-1".into(),
+            cwd: session.meta.workspace.clone(),
+            argv: vec![
+                "bash".into(),
+                "-lc".into(),
+                "echo changed > a.txt; exit 125".into(),
+            ],
+            spec: Spec {
+                enabled: false,
+                ..Spec::default()
+            },
+            ledger_dir: None,
+            timeout_ms: Some(30_000),
+            max_output_bytes: None,
+        })
+        .expect("a command exit is not a sandbox error");
+
+    assert_eq!(result.exit_code, 125);
+    assert_eq!(result.changes.len(), 1, "the write must still be reported");
+    assert_eq!(result.changes[0].path, "a.txt");
+    assert!(
+        result.changes[0]
+            .diff
+            .as_deref()
+            .is_some_and(|diff| diff.contains("+changed")),
+        "the diff must show what the command wrote"
+    );
+}
+
+/* ------------------------- symlinks and permissions --------------------- */
+/// A symlink is a file whose content is its target. Journaling it as one means
+/// `apply` can recreate the link, and retargeting it is a visible change rather
+/// than a silent one.
+#[test]
+fn a_symlink_is_journaled_and_applied() {
+    if !overlay_available() {
+        skip("overlayfs unavailable in a user namespace");
+        return;
+    }
+
+    let fixture = Fixture::new();
+    fixture.write("real.txt", "content\n");
+    let mut session = fixture.open("symlink", Mode::Overlay);
+
+    let created = exec(&mut session, "call-1", "ln -s real.txt link");
+    assert_eq!(created.changes.len(), 1);
+    assert_eq!(created.changes[0].op, Op::Add);
+    assert!(
+        std::fs::symlink_metadata(fixture.path("link")).is_err(),
+        "the real workspace must not have the link before `apply`"
+    );
+
+    // Retargeting the link changes its content, so it has to be reported. A
+    // symlink whose bytes are never read is invisible here.
+    let retargeted = exec(&mut session, "call-2", "ln -sfn other.txt link");
+    assert_eq!(
+        retargeted.changes.len(),
+        1,
+        "retargeting a symlink must be a change"
+    );
+    assert_eq!(retargeted.changes[0].op, Op::Modify);
+
+    let applied = session.apply(false).expect("apply");
+    assert!(applied.ok, "{:?}", applied.conflicts);
+    assert_eq!(
+        std::fs::read_link(fixture.path("link")).expect("link exists after apply"),
+        PathBuf::from("other.txt")
+    );
+}
+
+/// A pre-existing symlink makes the conflict check compare link *targets*: the
+/// digest recorded for a link is its target, so hashing what it points at would
+/// report a conflict for every link the session touched.
+#[test]
+fn a_retargeted_symlink_applies_and_a_user_edit_conflicts() {
+    if !overlay_available() {
+        skip("overlayfs unavailable in a user namespace");
+        return;
+    }
+
+    let fixture = Fixture::new();
+    fixture.write("real.txt", "content\n");
+    fixture.write("other.txt", "content\n");
+    fixture.write("third.txt", "content\n");
+    std::os::unix::fs::symlink("real.txt", fixture.path("link")).expect("baseline link");
+
+    let mut session = fixture.open("symlink-apply", Mode::Overlay);
+    exec(&mut session, "call-1", "ln -sfn other.txt link");
+    let applied = session.apply(false).expect("apply");
+    assert!(applied.ok, "unexpected conflicts: {:?}", applied.conflicts);
+    assert_eq!(
+        std::fs::read_link(fixture.path("link")).expect("link"),
+        PathBuf::from("other.txt")
+    );
+
+    // The same change, but this time a person moved the link first.
+    std::fs::remove_file(fixture.path("link")).expect("clear the applied link");
+    std::os::unix::fs::symlink("real.txt", fixture.path("link")).expect("reset link");
+    let mut second = fixture.open("symlink-conflict", Mode::Overlay);
+    exec(&mut second, "call-1", "ln -sfn other.txt link");
+    std::fs::remove_file(fixture.path("link")).expect("user moves the link");
+    std::os::unix::fs::symlink("third.txt", fixture.path("link")).expect("user edit");
+
+    let conflicted = second.apply(false).expect("apply");
+    assert!(!conflicted.ok, "a user edit to the link must be a conflict");
+    assert_eq!(conflicted.conflicts, vec!["link".to_string()]);
+}
+
+/// A mode-only change has identical bytes on both sides, which is exactly the
+/// case a content-only comparison drops. It has to be reported *and* applied.
+#[test]
+fn a_mode_change_is_journaled_and_applied() {
+    let fixture = Fixture::new();
+    fixture.write("script.sh", "#!/bin/sh\necho hi\n");
+    let script = fixture.path("script.sh");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o644)).expect("chmod 644");
+
+    let mut session = fixture.open("chmod", Mode::Overlay);
+    let result = exec(&mut session, "call-1", "chmod 755 script.sh");
+
+    assert_eq!(result.changes.len(), 1, "a chmod must be reported");
+    assert_eq!(result.changes[0].op, Op::Chmod);
+    assert_eq!(
+        std::fs::metadata(&script).expect("stat").mode() & 0o7777,
+        0o644,
+        "the real workspace must not be written before `apply`"
+    );
+
+    let applied = session.apply(false).expect("apply");
+    assert!(applied.ok, "{:?}", applied.conflicts);
+    assert_eq!(
+        std::fs::metadata(&script).expect("stat").mode() & 0o7777,
+        0o755,
+        "apply must reproduce the mode, not only the bytes"
+    );
+}
+
+/// Snapshot mode diffs the live tree, so a mode change has to be caught there
+/// too — the bug this pins was in the shared comparison, not in the overlay.
+#[test]
+fn snapshot_mode_reports_a_mode_change() {
+    let fixture = Fixture::new();
+    fixture.write("script.sh", "#!/bin/sh\necho hi\n");
+    let script = fixture.path("script.sh");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o644)).expect("chmod 644");
+
+    let mut session = fixture.open("chmod-snapshot", Mode::Snapshot);
+    let result = exec(&mut session, "call-1", "chmod 755 script.sh");
+
+    assert_eq!(result.changes.len(), 1, "a chmod must be reported");
+    assert_eq!(result.changes[0].op, Op::Chmod);
+    assert_eq!(
+        std::fs::metadata(&script).expect("stat").mode() & 0o7777,
+        0o755
+    );
+}
+
+/// `restore` has to put the permission bits back too, not just the bytes.
+#[test]
+fn restore_puts_a_mode_back() {
+    if !overlay_available() {
+        skip("overlayfs unavailable in a user namespace");
+        return;
+    }
+
+    let fixture = Fixture::new();
+    fixture.write("script.sh", "#!/bin/sh\necho hi\n");
+    let script = fixture.path("script.sh");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod 755");
+
+    let mut session = fixture.open("chmod-restore", Mode::Overlay);
+    exec(&mut session, "call-1", "chmod 600 script.sh");
+    assert_eq!(
+        exec(&mut session, "check", "stat -c %a script.sh")
+            .stdout
+            .trim(),
+        "600",
+        "the sandbox view must carry the new mode"
+    );
+
+    session.restore(None, true).expect("restore");
+
+    // The real workspace was never touched, so it still has the baseline mode;
+    // what has to be true is that the *session view* went back.
+    assert_eq!(
+        exec(&mut session, "check-2", "stat -c %a script.sh")
+            .stdout
+            .trim(),
+        "755",
+        "restore must reproduce the baseline mode, not only the bytes"
+    );
+    assert!(
+        session.changes().expect("changes").is_empty(),
+        "restoring must clear the recorded change"
+    );
+    assert_eq!(
+        std::fs::metadata(&script).expect("stat").mode() & 0o7777,
+        0o755
+    );
+}
+
+/// Restoring an added symlink has to remove it from the view, and restoring a
+/// retargeted one has to put the original target back.
+#[test]
+fn restore_puts_a_symlink_back() {
+    if !overlay_available() {
+        skip("overlayfs unavailable in a user namespace");
+        return;
+    }
+
+    let fixture = Fixture::new();
+    fixture.write("real.txt", "content\n");
+    fixture.write("other.txt", "content\n");
+    std::os::unix::fs::symlink("real.txt", fixture.path("link")).expect("baseline link");
+    let mut session = fixture.open("symlink-restore", Mode::Overlay);
+
+    exec(&mut session, "call-1", "ln -sfn other.txt link");
+    assert_eq!(
+        exec(&mut session, "check", "readlink link").stdout.trim(),
+        "other.txt"
+    );
+
+    session.restore(None, true).expect("restore");
+    assert_eq!(
+        exec(&mut session, "check-2", "readlink link").stdout.trim(),
+        "real.txt",
+        "restore must recreate the link, not a file holding its target"
+    );
+    assert_eq!(
+        std::fs::read_link(fixture.path("link")).expect("the real link is untouched"),
+        PathBuf::from("real.txt")
+    );
+}
+
+/// A symlink the session created is not in the baseline, so restoring means
+/// removing it again.
+#[test]
+fn restore_removes_an_added_symlink() {
+    if !overlay_available() {
+        skip("overlayfs unavailable in a user namespace");
+        return;
+    }
+
+    let fixture = Fixture::new();
+    fixture.write("real.txt", "content\n");
+    let mut session = fixture.open("symlink-added-restore", Mode::Overlay);
+
+    exec(&mut session, "call-1", "ln -s real.txt link");
+    assert_eq!(
+        exec(&mut session, "check", "readlink link").stdout.trim(),
+        "real.txt"
+    );
+
+    session.restore(None, true).expect("restore");
+    assert_eq!(
+        exec(
+            &mut session,
+            "check-2",
+            "test -L link && echo yes || echo no"
+        )
+        .stdout
+        .trim(),
+        "no",
+        "restoring an added link must remove it"
+    );
+    assert!(
+        std::fs::symlink_metadata(fixture.path("link")).is_err(),
+        "the real workspace is still untouched"
+    );
 }
