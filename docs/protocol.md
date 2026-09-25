@@ -113,6 +113,7 @@ provide it fails with `unsupported` rather than degrading.
     "enabled": true,
     "backend": "auto",              // auto | bubblewrap | landlock | none
     "writableRoots": ["/home/u/proj"],
+    "passthrough": ["/home/u/proj/target"],
     "network": "deny",              // deny | allow
     "maxOpenFiles": 4096
   },
@@ -129,6 +130,26 @@ about `read-only` / `workspace-write` / `approve-all`. Mapping a tier onto this
 is the caller's job — that is what lets several agents share one engine.
 
 An empty `writableRoots` makes the workspace read-only for the call.
+
+### `passthrough`
+
+Absolute paths **inside the workspace** that are bound straight from the real
+filesystem, winning over the overlay. For derived output: `target/`,
+`node_modules/`, `.venv/`.
+
+The command still runs against the merged view, so it reads the agent's edits; it
+writes those subtrees to the real disk, so build artefacts never enter `upper/`
+and never reach the CAS.
+
+Two invariants are enforced, because a caller that gets them wrong would quietly
+disable the whole mechanism:
+
+- the path must be inside the workspace — passthrough cannot widen the sandbox;
+- the path must not be (or contain) `.git` — history must stay journaled.
+
+Writes there are **not journaled and not reversible**. The declaration is
+recorded per call in the ledger, so the audit record is explicit about which
+calls had an unwatched subtree.
 
 ### Result
 

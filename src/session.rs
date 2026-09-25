@@ -186,6 +186,11 @@ impl Session {
         }
     }
 
+    /// Does this path exist in the pre-session baseline?
+    fn baseline_has(&self, key: &str) -> bool {
+        self.baseline_path(key).exists()
+    }
+
     fn observe(&self) -> Result<Manifest> {
         match self.meta.mode {
             Mode::Snapshot => fsutil::scan_tree(&self.meta.workspace),
@@ -234,6 +239,7 @@ impl Session {
             cwd: params.cwd.clone(),
             workspace: self.meta.workspace.clone(),
             writable_roots: effective_writable_roots(&params.spec, &self.meta.workspace),
+            passthrough: params.spec.passthrough.clone(),
             network: params.spec.network,
             max_open_files: params.spec.max_open_files,
             // Overlay mode always goes through bubblewrap: the merged view has
@@ -289,6 +295,12 @@ impl Session {
             duration_ms: outcome.duration_ms,
             mode: mode_name(self.meta.mode).to_string(),
             changes: ledger_changes,
+            passthrough: params
+                .spec
+                .passthrough
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect(),
             prev: String::new(),
             hash: String::new(),
         })?;
@@ -326,8 +338,13 @@ impl Session {
             let previous = before.get(key);
             let current = after.get(key);
 
-            // Directories are structural: they appear in the upper layer as
-            // soon as anything inside them is copied up.
+            // Directories are structural. overlayfs materialises a directory in
+            // `upper/` as soon as anything inside it is copied up, and that is
+            // not a change the caller asked for. A directory only counts when
+            // it does not exist in the baseline either.
+            if matches!(current.map(|e| e.kind), Some(Kind::Dir)) && self.baseline_has(key) {
+                continue;
+            }
             if matches!(previous.map(|e| e.kind), Some(Kind::Dir))
                 && matches!(current.map(|e| e.kind), Some(Kind::Dir))
             {
@@ -859,9 +876,15 @@ impl Session {
         for (key, entry) in &self.index.entries {
             let target = self.meta.workspace.join(key);
             if entry.current_exists {
-                let sha = entry.current_sha.clone().ok_or_else(|| {
-                    Error::Invalid(format!("{key} is marked present but has no digest"))
-                })?;
+                let Some(sha) = entry.current_sha.clone() else {
+                    // No digest means no content: a directory, or another
+                    // structural entry. Reproduce it as a directory.
+                    if self.observation_path(key).is_dir() {
+                        fsutil::ensure_dir(&target)?;
+                        applied.push(key.clone());
+                    }
+                    continue;
+                };
                 if !self.cas.export(&sha, &target)? {
                     return Err(Error::Invalid(format!(
                         "content for {key} ({sha}) is missing from the CAS"
@@ -904,17 +927,23 @@ impl Session {
             };
 
             if entry.baseline_exists {
-                let sha = entry
-                    .baseline_sha
-                    .clone()
-                    .ok_or_else(|| Error::Invalid(format!("{key} has no baseline digest")))?;
+                let Some(sha) = entry.baseline_sha.clone() else {
+                    // Baseline had no content: a directory.
+                    let _ = std::fs::create_dir_all(&target);
+                    self.index.entries.remove(&key);
+                    restored.push(key);
+                    continue;
+                };
                 if !self.cas.export(&sha, &target)? {
                     return Err(Error::Invalid(format!(
                         "baseline for {key} is missing from the CAS"
                     )));
                 }
             } else {
+                // Removing a directory only works once it is empty; files
+                // inside it are restored by their own index entries.
                 let _ = std::fs::remove_file(&target);
+                let _ = std::fs::remove_dir(&target);
             }
 
             self.index.entries.remove(&key);

@@ -121,6 +121,7 @@ fn probe_overlayfs() -> bool {
             cwd: overlay.merged.clone(),
             workspace: overlay.lower.clone(),
             writable_roots: Vec::new(),
+            passthrough: Vec::new(),
             network: crate::protocol::Network::Deny,
             max_open_files: None,
             sandboxed: false,

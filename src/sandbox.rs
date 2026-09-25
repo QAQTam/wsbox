@@ -49,6 +49,9 @@ pub struct RunRequest {
     pub cwd: PathBuf,
     pub workspace: PathBuf,
     pub writable_roots: Vec<PathBuf>,
+    /// Absolute paths bound straight from the real filesystem, bypassing the
+    /// overlay. Must be inside the workspace.
+    pub passthrough: Vec<PathBuf>,
     pub network: Network,
     pub max_open_files: Option<u64>,
     /// Wrap in bubblewrap. When false the command runs directly (still with
@@ -84,6 +87,13 @@ pub fn run(request: &RunRequest) -> Result<Outcome> {
     if let Some(overlay) = &request.overlay {
         for dir in [&overlay.upper, &overlay.work, &overlay.merged] {
             crate::fsutil::ensure_dir(dir)?;
+        }
+    }
+    // bubblewrap resolves a bind's *source* when it processes the option, so a
+    // passthrough directory has to exist on the host before the sandbox starts.
+    for path in &request.passthrough {
+        if !path.exists() {
+            crate::fsutil::ensure_dir(path)?;
         }
     }
 
@@ -198,6 +208,8 @@ struct MountPlan {
 
 impl Plan {
     fn build(request: &RunRequest) -> Result<Self> {
+        validate_passthrough(&request.workspace, &request.passthrough)?;
+
         let argv_strings = if request.sandboxed {
             build_bwrap_argv(request)?
         } else {
@@ -512,6 +524,20 @@ fn build_bwrap_argv(request: &RunRequest) -> Result<Vec<String>> {
         argv.push(root.display().to_string());
     }
 
+    // Selective passthrough: re-bind these subtrees from the real filesystem so
+    // they win over the merged view above.
+    //
+    // This must come *after* the workspace bind. `target/` and friends are then
+    // read and written on the real disk — the build runs at native speed, its
+    // artefacts never enter `upper/`, and incremental caches survive between
+    // calls. The price is that writes here are neither journaled nor
+    // reversible, so the list is validated and recorded rather than trusted.
+    for path in &request.passthrough {
+        argv.push("--bind".into());
+        argv.push(path.display().to_string());
+        argv.push(path.display().to_string());
+    }
+
     // Mask the ledger only after every bind has been set up.
     //
     // The mask is emitted unconditionally, even for a path that does not exist
@@ -544,6 +570,43 @@ fn would_shadow(dir: &Path, needed: &[&Path]) -> bool {
     needed.iter().any(|path| path.starts_with(dir))
 }
 
+/// Passthrough is a policy input, not something the agent may choose.
+///
+/// Two invariants make it safe to offer at all:
+///
+/// * it can only name paths **inside** the workspace, so it cannot widen the
+///   sandbox's reach;
+/// * it can never cover `.git`, so history cannot be rewritten through a path
+///   that the journal does not watch.
+fn validate_passthrough(workspace: &Path, paths: &[PathBuf]) -> Result<()> {
+    for path in paths {
+        if path == workspace {
+            return Err(Error::Invalid(
+                "the workspace root cannot be a passthrough path".into(),
+            ));
+        }
+        if !path.starts_with(workspace) {
+            return Err(Error::Invalid(format!(
+                "passthrough {} is outside the workspace {}",
+                path.display(),
+                workspace.display()
+            )));
+        }
+        let relative = path
+            .strip_prefix(workspace)
+            .unwrap_or_else(|_| Path::new(""));
+        if matches!(
+            relative.components().next(),
+            Some(std::path::Component::Normal(name)) if name == ".git"
+        ) {
+            return Err(Error::Invalid(
+                "`.git` must never be a passthrough path".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub fn which(program: &str) -> Option<String> {
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
@@ -566,6 +629,7 @@ mod tests {
             cwd: PathBuf::from("/work"),
             workspace: PathBuf::from("/work"),
             writable_roots: vec![PathBuf::from("/work")],
+            passthrough: Vec::new(),
             network: Network::Deny,
             max_open_files: None,
             sandboxed: true,

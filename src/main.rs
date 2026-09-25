@@ -67,6 +67,12 @@ enum Command {
         /// Make the workspace read-only for this call.
         #[arg(long)]
         read_only: bool,
+        /// Subtree bound straight from the real filesystem, bypassing the
+        /// overlay (e.g. `target`, `node_modules`). Writes there are not
+        /// journaled. May be repeated; relative paths resolve against the
+        /// workspace.
+        #[arg(long = "passthrough", value_name = "PATH")]
+        passthrough: Vec<PathBuf>,
         /// Print the raw protocol response instead of a summary.
         #[arg(long)]
         json: bool,
@@ -269,11 +275,22 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             timeout_ms,
             allow_network,
             read_only,
+            passthrough,
             json,
             argv,
         } => {
             let workspace = workspace_of(&session, ledger_dir.as_deref())?;
             let cwd = cwd.unwrap_or_else(|| workspace.clone());
+            let passthrough: Vec<PathBuf> = passthrough
+                .iter()
+                .map(|path| {
+                    if path.is_absolute() {
+                        path.clone()
+                    } else {
+                        workspace.join(path)
+                    }
+                })
+                .collect();
 
             let params = ExecParams {
                 session,
@@ -288,6 +305,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                     } else {
                         vec![workspace]
                     },
+                    passthrough,
                     network: if allow_network {
                         Network::Allow
                     } else {

@@ -37,6 +37,11 @@ pub struct LedgerEntry {
     pub duration_ms: u64,
     pub mode: String,
     pub changes: Vec<LedgerChange>,
+    /// Subtrees bound straight from the real filesystem for this call. Writes
+    /// there are neither journaled nor reversible, so the declaration itself is
+    /// part of the audit record.
+    #[serde(default)]
+    pub passthrough: Vec<String>,
     /// Digest of the previous entry (or [`GENESIS`]).
     pub prev: String,
     /// Digest over every other field of this entry plus `prev`.

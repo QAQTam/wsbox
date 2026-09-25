@@ -187,6 +187,16 @@ pub struct Spec {
     /// Roots the command may write. Empty means the workspace is read-only.
     #[serde(default)]
     pub writable_roots: Vec<PathBuf>,
+    /// Absolute paths inside the workspace that are bound straight from the
+    /// real filesystem, bypassing the overlay.
+    ///
+    /// This is for derived output — `target/`, `node_modules/`, `.venv/` — so a
+    /// build writes at native speed and its artefacts do not pollute the diff or
+    /// the content store. Writes here are **not journaled and not reversible**,
+    /// which is why the list is caller-declared and recorded in the ledger
+    /// rather than chosen by the agent.
+    #[serde(default)]
+    pub passthrough: Vec<PathBuf>,
     #[serde(default = "default_network")]
     pub network: Network,
     #[serde(default)]
@@ -209,6 +219,7 @@ impl Default for Spec {
             enabled: true,
             backend: Backend::Auto,
             writable_roots: Vec::new(),
+            passthrough: Vec::new(),
             network: Network::Deny,
             max_open_files: None,
         }

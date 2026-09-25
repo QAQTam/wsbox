@@ -123,6 +123,43 @@ downgrades** — callers decide whether the weaker guarantee is acceptable.
 
 `wsbox verify` walks the chain: a modified entry fails verification.
 
+## Selective passthrough
+
+Running `cargo build` inside the overlay would copy every artefact into `upper/`
+— thousands of files, none of them interesting, all of them filling the content
+store. The fix is to split by **path class**, not by tool:
+
+```
+/workspace               → overlay      (source: journaled, reversible)
+/workspace/target        → real fs, rw  (derived: not journaled)
+/workspace/node_modules  → real fs, rw
+~/.cargo/registry        → real fs, rw
+```
+
+`cargo` still runs against the *merged* view, so it reads the code the model just
+wrote. It writes `target/` straight to the real disk, so the build runs at native
+speed, incremental caches survive between calls, and the change set stays clean.
+
+```bash
+wsbox exec --session s1 --call c1 --passthrough target -- cargo build
+```
+
+Two invariants make this safe to offer at all, and both are enforced:
+
+- a passthrough path must be **inside the workspace**, so it cannot widen the
+  sandbox's reach;
+- it can never cover **`.git`**, so history cannot be rewritten through a path
+  the journal does not watch.
+
+Writes into a passthrough path are **not journaled and not reversible**. That is
+the deliberate trade: the list is caller-declared, never chosen by the agent, and
+the declaration itself is written into the ledger so the audit record says which
+calls had an unwatched subtree.
+
+> Splitting by *tool* instead — "cargo goes to the real workspace, python goes to
+> the overlay" — does not work. Build scripts write source files, and a model can
+> run `cargo` from `python`. Path class is the only stable boundary.
+
 ## Audit and retention
 
 **The ledger and the content store have separate retention policies.** That

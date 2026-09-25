@@ -54,6 +54,15 @@ impl Fixture {
 }
 
 fn exec(session: &mut Session, call: &str, script: &str) -> wsbox::protocol::ExecResult {
+    exec_with(session, call, script, Vec::new())
+}
+
+fn exec_with(
+    session: &mut Session,
+    call: &str,
+    script: &str,
+    passthrough: Vec<PathBuf>,
+) -> wsbox::protocol::ExecResult {
     session
         .exec(&ExecParams {
             session: session.meta.id.clone(),
@@ -63,6 +72,7 @@ fn exec(session: &mut Session, call: &str, script: &str) -> wsbox::protocol::Exe
             spec: Spec {
                 enabled: true,
                 writable_roots: vec![session.meta.workspace.clone()],
+                passthrough,
                 network: Network::Deny,
                 ..Spec::default()
             },
@@ -641,6 +651,185 @@ fn repeated_rewrites_are_bounded_by_gc() {
         after.changed_paths, before.changed_paths,
         "gc must not change the session's change set"
     );
+}
+
+/* --------------------------- selective passthrough ---------------------- */
+
+/// Build output should land on the real disk and stay out of the change set —
+/// otherwise `cargo build` alone would fill the content store with `target/`.
+#[test]
+fn passthrough_keeps_build_output_out_of_the_diff() {
+    if !overlay_available() {
+        skip("overlayfs unavailable in a user namespace");
+        return;
+    }
+
+    let fixture = Fixture::new();
+    fixture.write("src/main.rs", "fn main() { println!(\"hi\"); }\n");
+    let target = fixture.path("target");
+
+    let mut session = fixture.open("passthrough", Mode::Overlay);
+    let result = exec_with(
+        &mut session,
+        "call-1",
+        "mkdir -p target/debug && head -c 50000 /dev/zero > target/debug/artifact.o \
+         && sed -i 's/hi/hello/' src/main.rs",
+        vec![target.clone()],
+    );
+
+    // The build output is really on disk...
+    assert!(
+        target.join("debug/artifact.o").is_file(),
+        "passthrough writes must reach the real filesystem"
+    );
+    // ...and never entered the overlay, so it is not in the change set.
+    let paths: Vec<&str> = result.changes.iter().map(|c| c.path.as_str()).collect();
+    assert_eq!(
+        paths,
+        vec!["src/main.rs"],
+        "build output leaked into the diff"
+    );
+
+    // The source edit is still journaled and still recoverable.
+    assert!(
+        fixture.read("src/main.rs").contains("hi"),
+        "the real source file must be untouched"
+    );
+    assert!(result.changes[0].diff.as_deref().unwrap().contains("hello"));
+
+    // The declaration itself is part of the audit record.
+    let ledger = session
+        .query_ledger(&LedgerQueryParams {
+            session: session.meta.id.clone(),
+            ledger_dir: None,
+            call: None,
+            path: None,
+            since_seq: None,
+            limit: None,
+        })
+        .expect("query");
+    assert_eq!(
+        ledger.entries[0].passthrough,
+        vec![target.display().to_string()]
+    );
+}
+
+#[test]
+fn passthrough_outside_the_workspace_is_rejected() {
+    if !overlay_available() {
+        skip("overlayfs unavailable in a user namespace");
+        return;
+    }
+
+    let fixture = Fixture::new();
+    fixture.write("a.txt", "one\n");
+    let mut session = fixture.open("passthrough-escape", Mode::Overlay);
+
+    let result = session.exec(&ExecParams {
+        session: session.meta.id.clone(),
+        call: "call-1".into(),
+        cwd: session.meta.workspace.clone(),
+        argv: vec!["true".into()],
+        spec: Spec {
+            enabled: true,
+            writable_roots: vec![session.meta.workspace.clone()],
+            passthrough: vec![PathBuf::from("/etc")],
+            network: Network::Deny,
+            ..Spec::default()
+        },
+        ledger_dir: None,
+        timeout_ms: Some(10_000),
+        max_output_bytes: None,
+    });
+
+    assert!(
+        result.is_err(),
+        "a passthrough path outside the workspace must be refused"
+    );
+}
+
+#[test]
+fn git_cannot_be_a_passthrough_path() {
+    if !overlay_available() {
+        skip("overlayfs unavailable in a user namespace");
+        return;
+    }
+
+    let fixture = Fixture::new();
+    fixture.write("a.txt", "one\n");
+    std::fs::create_dir_all(fixture.path(".git")).expect("git dir");
+    let mut session = fixture.open("passthrough-git", Mode::Overlay);
+
+    let result = session.exec(&ExecParams {
+        session: session.meta.id.clone(),
+        call: "call-1".into(),
+        cwd: session.meta.workspace.clone(),
+        argv: vec!["true".into()],
+        spec: Spec {
+            enabled: true,
+            writable_roots: vec![session.meta.workspace.clone()],
+            passthrough: vec![fixture.path(".git")],
+            network: Network::Deny,
+            ..Spec::default()
+        },
+        ledger_dir: None,
+        timeout_ms: Some(10_000),
+        max_output_bytes: None,
+    });
+
+    assert!(
+        result.is_err(),
+        "`.git` must never bypass the journal, or history can be rewritten unseen"
+    );
+}
+
+/* ------------------------------ structural ------------------------------ */
+
+/// overlayfs materialises a directory in `upper/` as soon as anything inside it
+/// is copied up. That is not a change the caller asked for.
+#[test]
+fn copying_up_a_directory_is_not_reported_as_a_change() {
+    if !overlay_available() {
+        skip("overlayfs unavailable in a user namespace");
+        return;
+    }
+
+    let fixture = Fixture::new();
+    fixture.write("src/main.rs", "one\n");
+    fixture.write("src/lib.rs", "two\n");
+
+    let mut session = fixture.open("dirs", Mode::Overlay);
+    let result = exec(&mut session, "call-1", "echo changed > src/main.rs");
+
+    let paths: Vec<&str> = result.changes.iter().map(|c| c.path.as_str()).collect();
+    assert_eq!(
+        paths,
+        vec!["src/main.rs"],
+        "the parent directory is structural"
+    );
+}
+
+/// A genuinely new directory is a change, and `apply` has to reproduce it.
+#[test]
+fn a_new_directory_is_applied() {
+    if !overlay_available() {
+        skip("overlayfs unavailable in a user namespace");
+        return;
+    }
+
+    let fixture = Fixture::new();
+    fixture.write("a.txt", "one\n");
+
+    let mut session = fixture.open("new-dir", Mode::Overlay);
+    exec(
+        &mut session,
+        "call-1",
+        "mkdir -p nested/deep && echo x > nested/deep/b.txt",
+    );
+
+    let applied = session.apply(false).expect("apply");
+    assert!(applied.ok, "{:?}", applied.conflicts);
+    assert_eq!(fixture.read("nested/deep/b.txt"), "x\n");
 }
 
 /* ------------------------------ degraded mode --------------------------- */
