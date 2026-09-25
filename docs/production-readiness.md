@@ -13,7 +13,7 @@
 验收命令：
 
 ```bash
-cargo test --workspace --all-features    # 当前 134 项全绿
+cargo test --workspace --all-features    # 当前 135 项全绿
 cargo clippy --workspace --all-features --all-targets
 ```
 
@@ -42,6 +42,7 @@ DoD 的**主干已经达成**：本轮把 bash 常见的写文件方式逐条钉
 | 同尺寸不同内容 | 报 modify，且有 diff | `same_size_rewrite_is_reported_with_a_diff` |
 | 文件名含 `\`（Unix 普通字节） | 路径不失真，`apply` 生效 | `a_backslash_in_a_filename_is_not_a_directory_separator` |
 | 文件名不是合法 UTF-8 | 两个不同文件**不塌缩**，`apply`/`restore` 按原始字节生效 | `non_utf8_filenames_are_distinct_and_applied` |
+| 文件 > 8 MiB 改写 | `diff` 为 null + `diffTruncated` + warning，但 sha/apply/restore 全部正确 | `a_file_too_large_to_diff_is_still_reproducible` |
 | `sed -i`（临时文件 + rename） | 报一个 modify | `atomic_rename_is_one_modify` |
 | 二进制改写 | 报 modify，`diff: null` | `binary_change_is_reported_without_a_text_diff` |
 | `chmod` | 报 chmod 并落到真实文件 | `a_mode_change_is_journaled_and_applied`、`snapshot_mode_reports_a_mode_change` |
@@ -79,6 +80,7 @@ session id 不能借 `../` 写到账本目录之外（`a_session_id_cannot_escap
 | 10 | 非特权 overlayfs 未启用 `userxattr` | 删除/移动 lower 目录返回 `EIO`，bash 无法完成操作 | 挂载选项加 `userxattr`，在真实 overlay 上验证目录删除 |
 | 11 | baseline 目录在状态比较中按“不存在”处理 | 目录 whiteout 被静默丢弃，`rm -rf dir` 报 0 个变更 | 目录作为有类型、无内容的状态参与比较，并可按 baseline 重建 |
 | 12 | 非 UTF-8 文件名被 `to_string_lossy` 压成 U+FFFD | 两个不同文件塌缩成一条 `add �`，`apply` 报"content for � is missing" | 路径 key 字节精确：UTF-8 名字即自身，否则 `!hex:<原始字节>`；marker 也参与转义，保证单射（`docs/protocol.md`） |
+| 13 | 大文件被整体读进内存做 diff；且 `diff::unified` 把 `None` 当空内容 | GB 级文件 OOM；涨过阈值的文件会被渲染成"整个文件被删除"的假 diff；`before_state` 还把读不出来的 baseline 当成不存在，变更类型误判为 add | 超过 8 MiB 不读入内存（CAS 仍流式写入），缺失内容时**不渲染** diff 并置 `diffTruncated` + warning；baseline 用 `symlink_metadata` 判存在、流式 `hash_path` 算 sha |
 
 ---
 
@@ -96,10 +98,12 @@ session id 不能借 `../` 写到账本目录之外（`a_session_id_cannot_escap
 README 已承认（fanotify/FUSE 未做）。对 DoD 来说这是"定义边界"而非缺陷，
 但要在协议文档里写明：**diff 描述的是 end state，不是过程中的每一次写**。
 
-**3. 大文件全量读内存。** `compute_changes` 对每个变更路径
-`cas.get()` + `read_layer_content()`，GB 级文件会 OOM。
-> 修复：超过阈值（如 8 MiB）只算 sha 进 CAS、跳过文本 diff 并置
-> `diffTruncated`/新增 `binary` 标记；diff 渲染走流式。
+**3. 大文件全量读内存 —— 本轮已修复。** 超过 8 MiB 的文件不再读进内存渲染 diff
+（字节仍流式进 CAS，`apply`/`restore` 照常工作），变更标记为 `diffTruncated` 并带 warning，
+所以 review 的硬规则会把它拦住而不是放行。修的过程中发现并一并处理了两个陷阱：
+`diff::unified` 把缺失的一侧当空内容（会把涨过阈值的文件渲染成整文件删除），
+以及 `before_state` 把读不出来的 baseline 当成不存在（会把变更误判成 add）。
+见 §3 第 13 条。
 
 ### P1 —— 生产运维必需
 

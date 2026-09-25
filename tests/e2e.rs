@@ -1498,6 +1498,63 @@ fn non_utf8_filenames_are_distinct_and_applied() {
     );
 }
 
+/// A file too large to read into memory for a diff must still be journaled,
+/// flagged, and reproducible — and must never render as a whole-file deletion
+/// just because one side was not read.
+#[test]
+fn a_file_too_large_to_diff_is_still_reproducible() {
+    if !overlay_available() {
+        skip("overlayfs unavailable in a user namespace");
+        return;
+    }
+
+    let fixture = Fixture::new();
+    // Just over the inline diff limit (8 MiB).
+    let big = "x".repeat(9 * 1024 * 1024);
+    fixture.write("big.txt", &big);
+
+    let mut session = fixture.open("big-file", Mode::Overlay);
+    let result = exec(&mut session, "call-1", "printf 'y' >> big.txt");
+
+    assert_eq!(result.changes.len(), 1);
+    let change = &result.changes[0];
+    assert_eq!(change.op, Op::Modify);
+    assert!(
+        change.diff.is_none(),
+        "a 9 MiB file is not read to render a diff"
+    );
+    assert!(
+        change.diff_truncated,
+        "a reviewer must not think it saw the whole change"
+    );
+    assert_eq!(change.before_bytes, Some(big.len() as u64));
+    assert_eq!(change.after_bytes, Some(big.len() as u64 + 1));
+    assert!(
+        result.warnings.iter().any(|w| w.contains("big.txt")),
+        "the caller has to be told why there is no diff: {:?}",
+        result.warnings
+    );
+
+    // The bytes still reached the CAS, so apply works...
+    let applied = session.apply(false).expect("apply");
+    assert!(applied.ok, "{:?}", applied.conflicts);
+    assert_eq!(
+        std::fs::metadata(fixture.path("big.txt"))
+            .expect("stat")
+            .len(),
+        big.len() as u64 + 1
+    );
+
+    // ...and so does restore, from the baseline that was streamed in.
+    session.restore(None, true).expect("restore");
+    let upper = session.root.join("upper").join("big.txt");
+    assert_eq!(
+        std::fs::metadata(&upper).expect("upper copy").len(),
+        big.len() as u64,
+        "the baseline must be in the CAS, not lost because it was too big to read"
+    );
+}
+
 /* ------------------------- symlinks and permissions --------------------- */
 /// A symlink is a file whose content is its target. Journaling it as one means
 /// `apply` can recreate the link, and retargeting it is a visible change rather

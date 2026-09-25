@@ -199,8 +199,12 @@ calls had an unwatched subtree.
   injective: a file literally named `!hex:...` is escaped too. Use
   `wsbox::fsutil::{encode_key, decode_key}` to convert; `restore --path` and the
   ledger query filters accept either the key or a plain relative path.
-- `diffTruncated` marks a diff clipped to 64 KiB. The full text is always in the
-  CAS, keyed by `beforeSha` / `afterSha`.
+- `diffTruncated` marks a diff the reviewer did not see in full. It is set both
+  when a diff is clipped to 64 KiB and when a file is larger than 8 MiB and is
+  therefore not read to render one at all (`diff` is then `null` and a `warnings`
+  entry says so). Either way the bytes are in the CAS, keyed by `beforeSha` /
+  `afterSha`, so `apply` and `restore` still work — only the inline view is
+  partial, and a change set containing one must not be auto-approved.
 - `suspicious` means the file lost at least 80% of its content and was at least
   1 KiB before. **The engine only reports it — deciding what to do is the
   caller's job.**

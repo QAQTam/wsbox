@@ -35,6 +35,13 @@ const SUSPICIOUS_MIN_BYTES: u64 = 1024;
 const SUSPICIOUS_SHRINK_RATIO: f64 = 0.8;
 /// Unified diffs returned inline are capped; the full diff is always on disk.
 const MAX_DIFF_BYTES: usize = 64 * 1024;
+/// Files larger than this are not read into memory just to render a diff.
+///
+/// The bytes still reach the CAS — streamed, not buffered — so the change stays
+/// reproducible and `apply`/`restore` still work. What is lost is the inline
+/// diff, which is why such a change is marked `diffTruncated`: a reviewer must
+/// not mistake a partial view for a complete one.
+const MAX_INLINE_DIFF_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -406,28 +413,59 @@ impl Session {
 
             // The baseline is made durable *before* the change is reported, so
             // there is no window in which a diff refers to content that cannot
-            // be recovered.
+            // be recovered. A file too large to hold in memory is streamed
+            // instead — `apply` and `restore` need the bytes either way.
             if let Some(content) = &before_state.content {
                 self.cas.put_bytes(content)?;
+            } else if let Some(sha) = &before_state.sha
+                && !self.cas.has(sha)
+            {
+                // The observation layer holds the *after* state by now, so the
+                // before bytes can only come from the baseline. Anything that
+                // was in the observation layer before the call was already
+                // streamed by `persist_baseline`, which is why this usually
+                // finds the blob present and does nothing.
+                let source = self.baseline_path(key);
+                if source.is_file() {
+                    self.cas.put_file(&source)?;
+                }
             }
             if let Some(content) = &after_state.content {
                 self.cas.put_bytes(content)?;
+            } else if let Some(sha) = &after_state.sha
+                && !self.cas.has(sha)
+            {
+                let source = self.observation_path(key);
+                if source.is_file() {
+                    self.cas.put_file(&source)?;
+                }
             }
 
-            let (rendered, truncated) = match diff::unified(
-                before_state.content.as_deref(),
-                after_state.content.as_deref(),
-                key,
-            ) {
-                Some(text) => diff::clamp(&text, MAX_DIFF_BYTES),
-                None => (String::new(), false),
-            };
+            // `diff::unified` reads a missing side as empty, which is right for
+            // an add or a delete and wrong for "we did not read this": a file
+            // that grew past the inline limit would render as a whole-file
+            // deletion. Render only when every side that has content was
+            // actually read.
+            let (rendered, truncated) =
+                if content_unavailable(&before_state) || content_unavailable(&after_state) {
+                    (String::new(), true)
+                } else {
+                    match diff::unified(
+                        before_state.content.as_deref(),
+                        after_state.content.as_deref(),
+                        key,
+                    ) {
+                        Some(text) => diff::clamp(&text, MAX_DIFF_BYTES),
+                        None => (String::new(), false),
+                    }
+                };
 
             let (suspicious, reason) = assess_shrink(&before_state.bytes, &after_state.bytes);
 
-            if before_state.exists && before_state.sha.is_some() && before_state.content.is_none() {
+            if content_unavailable(&before_state) || content_unavailable(&after_state) {
                 warnings.push(format!(
-                    "baseline content for {key} could not be read; the change is reported without a diff"
+                    "{key}: content is not available inline (too large or unreadable); \
+                     the change is reported without a diff"
                 ));
             }
 
@@ -549,8 +587,11 @@ impl Session {
         }
 
         let path = self.baseline_path(key);
-        let mode = mode_of(&path);
-        if is_real_dir(&path) {
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            return Ok(State::absent());
+        };
+        let mode = Some(metadata.mode());
+        if metadata.is_dir() {
             return Ok(State {
                 exists: true,
                 bytes: None,
@@ -567,9 +608,23 @@ impl Session {
                 mode,
                 content: Some(content),
             }),
-            // Unreadable, or not a thing with content: treat it as absent, the
-            // same way an unreadable baseline has always been treated.
-            _ => Ok(State::absent()),
+            // Present, but not read into memory: too large, unreadable, or a
+            // kind with no content at all. Hashing streams, so the change is
+            // still classified correctly instead of looking like an addition.
+            _ if metadata.is_file() || metadata.file_type().is_symlink() => Ok(State {
+                exists: true,
+                bytes: Some(metadata.len()),
+                sha: fsutil::hash_path(&path).ok(),
+                mode,
+                content: None,
+            }),
+            _ => Ok(State {
+                exists: true,
+                bytes: Some(metadata.len()),
+                sha: None,
+                mode,
+                content: None,
+            }),
         }
     }
 
@@ -1252,16 +1307,36 @@ impl State {
 /// A symlink is not followed: the journal records what the link *says*, which is
 /// what makes retargeting it a change and what makes it reproducible. Anything
 /// that is neither a regular file nor a symlink (a fifo, a device, a directory)
-/// has no content.
+/// has no content. A file above [`MAX_INLINE_DIFF_BYTES`] is reported as having
+/// no content *for the diff* — its bytes are still hashed and streamed into the
+/// CAS elsewhere.
 fn read_layer_content(path: &Path) -> Result<Option<Vec<u8>>> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
             Ok(Some(fsutil::read_link_bytes(path)?))
         }
-        Ok(metadata) if metadata.is_file() => Ok(Some(fsutil::read_file(path)?)),
+        Ok(metadata) if metadata.is_file() => {
+            if metadata.len() > MAX_INLINE_DIFF_BYTES {
+                return Ok(None);
+            }
+            Ok(Some(fsutil::read_file(path)?))
+        }
         Ok(_) => Ok(None),
         Err(_) => Ok(None),
     }
+}
+
+/// True when this state is a file or a symlink whose bytes we do not have in
+/// memory. It is the only case where "no diff" means "we did not look" rather
+/// than "there is nothing to show" — a directory or a fifo has no content by
+/// nature and must not be reported as a clipped diff.
+fn content_unavailable(state: &State) -> bool {
+    state.exists
+        && state.content.is_none()
+        && state.mode.is_some_and(|mode| {
+            let kind = mode & libc::S_IFMT;
+            kind == libc::S_IFREG || kind == libc::S_IFLNK
+        })
 }
 
 /// True when the path's current state is its baseline state, so nothing is

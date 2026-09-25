@@ -699,9 +699,28 @@ fn print_change_summary(result: &serde_json::Value) {
             if total > 12 {
                 eprintln!("      [... {} more diff lines ...]", total - 12);
             }
+        } else if change
+            .get("diffTruncated")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            // No diff and no explanation is the worst of both: say why the
+            // change cannot be shown inline.
+            eprintln!("      [diff not shown: file is too large to render inline]");
         }
         if let Some(reason) = change.get("reason").and_then(|v| v.as_str()) {
             suspicious.push(format!("{path}: {reason}"));
+        }
+    }
+
+    // Warnings explain a missing or partial diff; a caller that never sees them
+    // cannot tell "nothing to show" from "we did not look".
+    if let Some(warnings) = result.get("warnings").and_then(|v| v.as_array())
+        && !warnings.is_empty()
+    {
+        eprintln!("\nwarning:");
+        for warning in warnings.iter().filter_map(|v| v.as_str()) {
+            eprintln!("  {warning}");
         }
     }
 
