@@ -4,7 +4,23 @@
 > 不误报、diff 与真实字节一致、`apply` / `restore` 能复现。
 >
 > 状态：**内部检查点，不是 release**。tag `checkpoint-1`，用于内部测试；
-> 未发布、未建 GitHub Release、未承诺对外兼容。工作区干净，无未提交改动。
+> 未建 GitHub Release、未承诺对外兼容。工作区干净，无未提交改动。
+
+## 0. 获取
+
+```
+https://github.com/QAQTam/wsbox        # 仓库是 public，但这不是一次发布
+git clone https://github.com/QAQTam/wsbox && cd wsbox
+git checkout checkpoint-1             # = master@2ce4407（推送时的 HEAD）
+```
+
+| ref | commit | 说明 |
+|---|---|---|
+| `master` | `2ce4407` | 与 `checkpoint-1` 同一提交 |
+| `checkpoint-1` | `2ce4407` | annotated tag，说明里列了不在本检查点内的项 |
+
+> 仓库 public ≠ 已发布：**没有 release 产物、没有版本兼容承诺**，API/协议仍可在下一轮调整。
+> 上一轮评审提出的协议级改动（如 reconcile 的账本语义）不需要兼容性讨论即可进行。
 
 ---
 
@@ -116,3 +132,5 @@ wsbox verify  --session s                       # 链完整
 - **overlay 的四个目录（lower/upper/work/merged）必须在同一文件系统**；ledger 与 workspace 分处不同 fs 时 mount 会失败。
 - 非特权 overlayfs 需要 `userxattr` 挂载选项（已加），否则 unlink/rename 下层目录会返回 `EIO`。
 - `Cargo.lock` 里的 `time` / `cookie_store` 写着 `rust-version = 1.88`，但它们被 ureq 的非默认 `cookies` feature 挡住，**不参与构建** —— 不要据此推断 MSRV。
+- `.codegraph/` 是本地代码索引缓存，已加入 `.gitignore`（各机器自建，不入库）。
+- 推送前做过凭据自查：无 `.env`/`.key`/私钥入库，无硬编码凭据，历史里也没有过。
