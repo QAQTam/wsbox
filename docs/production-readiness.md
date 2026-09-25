@@ -73,7 +73,7 @@ session id 不能借 `../` 写到账本目录之外（`a_session_id_cannot_escap
 | 5 | 目录跳过用"存在"而不是"是目录" | 文件被替换成目录时**完全不上报**，`apply` 因此冲突/失败 | 比较 baseline 的真实类型 |
 | 6 | fifo 报 add 但 `apply` 静默跳过 | 报成功却没写 | fifo 用 `mkfifo` 复现；socket/设备节点显式报错而不是静默 |
 | 7 | `stdoutSpill` 指向不存在的 `stdout.full.txt` | 调用方按路径取全文会失败 | 指向真实的 `calls/<id>/stdout.txt` |
-| 8 | `rust-version = "1.85"` 但用了 let-chains（1.88 才有） | 声明的 MSRV 是假的 | 改为 `1.88`（本机无法装 1.88 验证，见 §4 P1-9） |
+| 8 | `rust-version = "1.85"` 但用了 let-chains（1.88 才有） | 声明的 MSRV 是假的 | 先改为 `1.88`（真实下限），再按维护策略提到 **1.92** 并在 1.92.0 上实测（§4 P1-9） |
 | 9 | Unix 文件名中的 `\` 被改写成 `/` | diff 路径不存在，两个文件可能塌缩成一个，`apply` 失败 | 保留反斜杠原始字节；只有 `/` 是 Unix 路径分隔符 |
 | 10 | 非特权 overlayfs 未启用 `userxattr` | 删除/移动 lower 目录返回 `EIO`，bash 无法完成操作 | 挂载选项加 `userxattr`，在真实 overlay 上验证目录删除 |
 | 11 | baseline 目录在状态比较中按“不存在”处理 | 目录 whiteout 被静默丢弃，`rm -rf dir` 报 0 个变更 | 目录作为有类型、无内容的状态参与比较，并可按 baseline 重建 |
@@ -113,9 +113,14 @@ README 已承认（fanotify/FUSE 未做）。对 DoD 来说这是"定义边界"�
 需要在 `open`/`exec` 时检测"上次未完成的调用"。
 **7. 超时只杀进程组。** 非 sandboxed 模式下孙进程可能存活。
 **8. `gc` 手动、CAS 无 chunk 级去重**（README 已承认；重复大文件重写是已知最坏情况）。
-**9. CI 缺失。** 没有 workflow，MSRV 无法被验证（本机 `rustup` 下载 1.88 失败，
-只能靠代码审查断定下限是 1.88）。建议最小 CI：
-`cargo test --workspace --all-features` + `cargo clippy -D warnings` + `cargo +1.88 check`。
+**9. CI 已补上，但 MSRV 只是一个声明。** `.github/workflows/ci.yml` 现在跑
+`cargo test --workspace --all-features` + `cargo clippy -- -D warnings`，
+并用 `cargo check` 在声明的最低版本上验证。
+当前声明是 **1.92**（1.92.0 已在本机实测：check / 128 项测试 / clippy -D warnings 全绿）。
+注意这是**维护策略**而非技术下限 —— 代码真正需要的是 1.88（2024 edition 的 let-chains），
+依赖图里最高的只有 1.85（clap / getrandom / ureq）；`Cargo.lock` 里的
+`time 0.3.55`、`cookie_store 0.22.1` 虽然写着 `rust-version = 1.88.0`，
+但它们被 ureq 的非默认 `cookies` feature 挡住，**不参与构建**，不要被它们误导。
 
 ### P2 —— 协议与接口
 

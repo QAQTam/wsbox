@@ -5,17 +5,17 @@ resolver = "2"
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-# 1.88 is the floor for `let` chains in the 2024 edition, which the session and
-# policy code uses. Declaring 1.85 made the manifest a promise the code did not
-# keep.
-rust-version = "1.88"
+# A floor, not a target: this is the oldest toolchain the workspace is tested
+# on. `let` chains (2024 edition) need 1.88; the workspace is checked against
+# 1.92 in CI, and built with whatever stable the developer or CI has.
+rust-version = "1.92"
 license = "MIT"
 
 [package]
 name = "wsbox"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.92"
 license = "MIT"
 description = "Workspace ledger sandbox: every write is observed, diffed and reversible"
 repository = "https://github.com/qaqtamsy/wsbox"

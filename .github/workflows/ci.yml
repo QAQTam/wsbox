@@ -37,10 +37,11 @@ jobs:
       - uses: actions/checkout@v4
 
       # `rust-version` in Cargo.toml is a promise; this job is what keeps it
-      # honest. It is currently the floor for `let` chains in the 2024 edition.
+      # honest. It is the oldest toolchain the workspace claims to support —
+      # not the newest it can run on, which is the runner's own stable.
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.88.0"
+          toolchain: "1.92.0"
 
       - name: Check on the declared minimum
         run: cargo check --workspace --all-features
