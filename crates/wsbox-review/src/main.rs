@@ -107,6 +107,17 @@ struct ResolveArgs {
     #[arg(long, value_enum)]
     outcome: HumanOutcome,
 
+    /// Whether a person clicked or the decision window expired.
+    ///
+    /// A timeout is not a label. Record it honestly or the corpus will teach
+    /// the model that silence means consent.
+    #[arg(long, value_enum, default_value_t = SourceArg::Explicit)]
+    source: SourceArg,
+
+    /// How long the decision window was open, in milliseconds.
+    #[arg(long)]
+    window_ms: Option<u64>,
+
     /// Which review this resolves. Defaults to the newest unresolved one.
     #[arg(long)]
     review: Option<u64>,
@@ -160,6 +171,11 @@ struct ExportArgs {
     #[arg(long)]
     agreed_only: bool,
 
+    /// laya: keep only reviews a person actually clicked. Windows that simply
+    /// expired are not labels.
+    #[arg(long)]
+    observed_only: bool,
+
     /// laya: include answers the router refuses to threshold. Off by default —
     /// an uncalibrated number is not a target.
     #[arg(long)]
@@ -197,6 +213,23 @@ impl From<ModeArg> for Mode {
         match value {
             ModeArg::Rules => Mode::RulesOnly,
             ModeArg::Hosted => Mode::Hosted,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum SourceArg {
+    /// A person clicked.
+    Explicit,
+    /// The window expired and the model's choice was taken.
+    Timeout,
+}
+
+impl From<SourceArg> for wsbox_review::export::HumanSource {
+    fn from(value: SourceArg) -> Self {
+        match value {
+            SourceArg::Explicit => Self::Explicit,
+            SourceArg::Timeout => Self::Timeout,
         }
     }
 }
@@ -315,6 +348,12 @@ fn mode_name(mode: Mode) -> &'static str {
 
 /* ------------------------------- resolve/stats -------------------------- */
 
+/// How many *clicked* decisions a risk class needs before its gate is relaxed.
+///
+/// Deliberately counted in observed decisions, not total ones. A gate that
+/// relaxes because a machine sat unattended for a week has measured nothing.
+const MIN_OBSERVED_FOR_PROMOTION: u64 = 30;
+
 fn review_log(session: &wsbox::session::Session) -> PathBuf {
     session.root.join("review.jsonl")
 }
@@ -380,6 +419,8 @@ fn run_resolve(args: &ResolveArgs) -> Result<(), String> {
         "reviewId": review_id,
         "atMs": wsbox::ledger::now_ms(),
         "humanOutcome": args.outcome,
+        "source": wsbox_review::export::HumanSource::from(args.source),
+        "windowMs": args.window_ms,
         "note": args.note,
     });
 
@@ -423,16 +464,25 @@ fn run_stats(args: &StatsArgs) -> Result<(), String> {
     let mut hold = Bucket::default();
     let mut with_fallbacks: u64 = 0;
 
-    let resolutions: std::collections::BTreeMap<u64, String> = records
+    // `(outcome, was it clicked)` — the second half is what decides whether a
+    // resolution counts as evidence.
+    let resolutions: std::collections::BTreeMap<u64, (String, bool)> = records
         .iter()
         .filter(|record| record["kind"] == "resolution")
         .filter_map(|record| {
+            let source = record["source"].as_str().unwrap_or("explicit");
             Some((
                 record["reviewId"].as_u64()?,
-                record["humanOutcome"].as_str()?.to_string(),
+                (
+                    record["humanOutcome"].as_str()?.to_string(),
+                    source == "explicit",
+                ),
             ))
         })
         .collect();
+
+    let mut observed: u64 = 0;
+    let mut timed_out: u64 = 0;
 
     for record in records.iter().filter(|record| record["kind"] == "review") {
         let Some(id) = record["reviewId"].as_u64() else {
@@ -443,10 +493,23 @@ fn run_stats(args: &StatsArgs) -> Result<(), String> {
             "hold" => &mut hold,
             _ => &mut review,
         };
-        match resolutions.get(&id).map(String::as_str) {
-            Some("apply") => bucket.applied += 1,
-            Some("reject") => bucket.rejected += 1,
-            _ => bucket.unresolved += 1,
+        match resolutions.get(&id) {
+            Some((outcome, true)) => {
+                observed += 1;
+                if outcome == "apply" {
+                    bucket.applied += 1;
+                } else {
+                    bucket.rejected += 1;
+                }
+            }
+            Some((_, false)) => {
+                // A window that expired is not a verdict. Counting it as one
+                // would let a machine left alone overnight look like a user who
+                // approved everything.
+                timed_out += 1;
+                bucket.unresolved += 1;
+            }
+            None => bucket.unresolved += 1,
         }
         if record["decision"]["rationale"]["fallbacks"]
             .as_array()
@@ -470,6 +533,8 @@ fn run_stats(args: &StatsArgs) -> Result<(), String> {
             "session": args.session,
             "total": total,
             "resolved": resolved,
+            "observed": observed,
+            "timedOut": timed_out,
             "withFallbacks": with_fallbacks,
             "buckets": {
                 "auto_apply": { "applied": auto.applied, "rejected": auto.rejected, "unresolved": auto.unresolved },
@@ -478,6 +543,7 @@ fn run_stats(args: &StatsArgs) -> Result<(), String> {
             },
             "dangerousAutoApprove": auto.rejected,
             "annoyingHold": hold.applied,
+            "readyToPromote": auto.rejected == 0 && observed >= MIN_OBSERVED_FOR_PROMOTION,
         });
         println!(
             "{}",
@@ -491,7 +557,12 @@ fn run_stats(args: &StatsArgs) -> Result<(), String> {
         return Ok(());
     }
 
-    println!("reviews {total}   resolved {resolved}   with fallbacks {with_fallbacks}\n");
+    println!(
+        "reviews {total}   observed {observed}   timed out {timed_out}   with fallbacks {with_fallbacks}"
+    );
+    println!(
+        "only the {observed} observed one(s) are evidence; a countdown that expired is the absence of one.\n"
+    );
     println!(
         "{:<16}{:>10}{:>10}{:>12}",
         "model said", "applied", "rejected", "unresolved"
@@ -509,9 +580,17 @@ fn run_stats(args: &StatsArgs) -> Result<(), String> {
             "DANGEROUS: the model would have auto-applied {} change set(s) a person rejected.",
             auto.rejected
         );
-        println!("           do not enable auto-approve until this is zero.");
-    } else if resolved > 0 {
-        println!("no dangerous auto-approvals in {resolved} resolved review(s).");
+        println!("           do not relax the gate until this is zero.");
+    } else if observed == 0 {
+        println!("no observed decisions yet — a timeout is not evidence for promotion.");
+    } else if observed < MIN_OBSERVED_FOR_PROMOTION {
+        println!(
+            "no dangerous auto-approvals in {observed} observed review(s), but {MIN_OBSERVED_FOR_PROMOTION} are needed before relaxing the gate."
+        );
+    } else {
+        println!(
+            "no dangerous auto-approvals in {observed} observed review(s) — the gate can be relaxed for the classes with zero."
+        );
     }
     if hold.applied > 0 {
         println!(
@@ -587,9 +666,10 @@ fn run_export(args: &ExportArgs) -> Result<(), String> {
                     std::fs::write(path, &report.csv)
                         .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
                     eprintln!(
-                        "{} row(s), {} resolved, {} session(s) -> {}",
+                        "{} row(s), {} resolved ({} observed), {} session(s) -> {}",
                         report.rows,
                         report.resolved,
+                        report.observed,
                         logs.len(),
                         path.display()
                     );
@@ -607,6 +687,7 @@ fn run_export(args: &ExportArgs) -> Result<(), String> {
         FormatArg::Laya => {
             let options = wsbox_review::export::LayaExportOptions {
                 resolved_only: args.resolved_only,
+                observed_only: args.observed_only,
                 agreed_only: args.agreed_only,
                 trustworthy_only: !args.include_uncalibrated,
             };

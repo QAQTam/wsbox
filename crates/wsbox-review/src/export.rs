@@ -102,6 +102,37 @@ pub struct ResolutionRecord {
     pub human_outcome: String,
     #[serde(default)]
     pub note: Option<String>,
+    /// How the outcome came about.
+    ///
+    /// This is the difference between a label and a guess. A verdict a person
+    /// actively clicked is evidence; one that arrived because a countdown
+    /// expired while they were making coffee is the *absence* of evidence.
+    /// Conflating the two is how a corpus teaches a model that silence means
+    /// consent — and the model then learns to approve things nobody looked at.
+    #[serde(default)]
+    pub source: HumanSource,
+    /// How long the decision window was open. A timeout that fired in 5s while
+    /// the user was reading a diff is not the same as one that fired while they
+    /// were away, and the ratio is the signal that says which.
+    #[serde(default)]
+    pub window_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HumanSource {
+    /// A person clicked. This is a label.
+    #[default]
+    Explicit,
+    /// The decision window expired and the model's choice was taken. This is
+    /// not a label — it is the absence of one.
+    Timeout,
+}
+
+impl HumanSource {
+    pub fn is_evidence(&self) -> bool {
+        matches!(self, HumanSource::Explicit)
+    }
 }
 
 impl LogEntry {
@@ -178,6 +209,7 @@ const BASE_COLUMNS: &[&str] = &[
     "resolved_at_ms",
     "resolved",
     "human_outcome",
+    "human_source",
     "human_note",
     "assessed_action",
     "may_auto_apply",
@@ -227,6 +259,9 @@ pub struct ExportReport {
     pub csv: String,
     pub rows: usize,
     pub resolved: usize,
+    /// Resolutions a person actually clicked, as opposed to windows that
+    /// expired. Only these are labels.
+    pub observed: usize,
     pub head: String,
 }
 
@@ -246,6 +281,7 @@ pub fn export(sessions: &[SessionLog], options: &ExportOptions) -> Result<Export
 
     let mut rows: Vec<Fields> = Vec::new();
     let mut resolved_count = 0usize;
+    let mut observed_count = 0usize;
 
     for session in sessions {
         let resolutions: BTreeMap<u64, &ResolutionRecord> = session
@@ -269,16 +305,14 @@ pub fn export(sessions: &[SessionLog], options: &ExportOptions) -> Result<Export
         reviews.sort_by_key(|record| (record.at_ms, record.review_id));
 
         for record in reviews {
-            let resolution = resolutions.get(&record.review_id);
-            if resolution.is_some() {
+            let resolution = resolutions.get(&record.review_id).copied();
+            if let Some(resolution) = resolution {
                 resolved_count += 1;
+                if resolution.source.is_evidence() {
+                    observed_count += 1;
+                }
             }
-            rows.push(build_row(
-                &session.session_id,
-                record,
-                resolution.copied(),
-                options,
-            ));
+            rows.push(build_row(&session.session_id, record, resolution, options));
         }
     }
 
@@ -309,6 +343,7 @@ pub fn export(sessions: &[SessionLog], options: &ExportOptions) -> Result<Export
         csv,
         rows: rows.len(),
         resolved: resolved_count,
+        observed: observed_count,
         head: previous,
     })
 }
@@ -359,6 +394,15 @@ fn build_row(
         "human_outcome".into(),
         resolution
             .map(|r| r.human_outcome.clone())
+            .unwrap_or_default(),
+    );
+    row.insert(
+        "human_source".into(),
+        resolution
+            .map(|r| match r.source {
+                HumanSource::Explicit => "explicit".to_string(),
+                HumanSource::Timeout => "timeout".to_string(),
+            })
             .unwrap_or_default(),
     );
     row.insert(
@@ -547,6 +591,8 @@ pub struct LayaMeta {
     pub battery_fingerprint: String,
     pub model: Option<String>,
     pub human_outcome: Option<String>,
+    /// Whether the person clicked or the window expired.
+    pub human_source: Option<HumanSource>,
     /// Whether the human agreed with the model's decision. A distillation run
     /// wants this to filter; a calibration run wants it as the label.
     pub human_agreed: Option<bool>,
@@ -556,6 +602,10 @@ pub struct LayaMeta {
 pub struct LayaExportOptions {
     /// Keep only cases a person resolved.
     pub resolved_only: bool,
+    /// Keep only cases a person actually clicked, dropping windows that simply
+    /// expired. A timeout is not a label, and training on one teaches the model
+    /// that silence means consent.
+    pub observed_only: bool,
     /// Keep only cases where the human agreed with the model. Distilling a
     /// disagreement teaches the model to reproduce a decision that was
     /// rejected.
@@ -569,6 +619,7 @@ impl Default for LayaExportOptions {
     fn default() -> Self {
         Self {
             resolved_only: false,
+            observed_only: false,
             agreed_only: false,
             trustworthy_only: true,
         }
@@ -583,6 +634,11 @@ pub fn laya_case(
     options: &LayaExportOptions,
 ) -> Option<LayaCase> {
     if options.resolved_only && resolution.is_none() {
+        return None;
+    }
+    if options.observed_only
+        && !resolution.is_some_and(|resolution| resolution.source.is_evidence())
+    {
         return None;
     }
 
@@ -678,6 +734,7 @@ pub fn laya_case(
             battery_fingerprint: record.battery_fingerprint.clone(),
             model: rationale["model"].as_str().map(str::to_string),
             human_outcome,
+            human_source: resolution.map(|r| r.source),
             human_agreed,
         }),
     })
@@ -1010,6 +1067,8 @@ mod tests {
                     at_ms: 200,
                     human_outcome: "apply".into(),
                     note: Some("fine, and it had a comma, a \"quote\" and\na newline".into()),
+                    source: HumanSource::Explicit,
+                    window_ms: Some(5000),
                 }),
                 review(2, "hold", 300),
             ],
@@ -1241,6 +1300,54 @@ mod tests {
         assert_eq!(included.cases, 1);
     }
 
+    /// The design this schema exists to support: a 5-second window that
+    /// proceeds with the model's choice if nobody acts. Silence must be
+    /// recorded as a timeout, never as an approval — otherwise a machine left
+    /// alone overnight produces a corpus in which every change was "approved",
+    /// and the model learns that nobody looking means yes.
+    #[test]
+    fn a_timeout_is_not_a_label() {
+        let answers = serde_json::json!({
+            "lost_content": answer(
+                serde_json::json!({"probability": 0.1}), "calibrated", Some(vec![0.9, 0.1])),
+        });
+        let mut sessions = laya_session(answers);
+        sessions[0]
+            .entries
+            .push(LogEntry::Resolution(ResolutionRecord {
+                review_id: 1,
+                at_ms: 5200,
+                human_outcome: "apply".into(),
+                note: None,
+                source: HumanSource::Timeout,
+                window_ms: Some(5000),
+            }));
+
+        let all = export_laya(&sessions, &LayaExportOptions::default());
+        assert_eq!(all.cases, 1, "a timeout still appears in the log");
+
+        let observed = export_laya(
+            &sessions,
+            &LayaExportOptions {
+                observed_only: true,
+                ..LayaExportOptions::default()
+            },
+        );
+        assert_eq!(
+            observed.cases, 0,
+            "a window that expired is not evidence of agreement"
+        );
+    }
+
+    #[test]
+    fn the_csv_distinguishes_clicked_from_expired() {
+        let report = export(&sessions(), &ExportOptions::default()).expect("export");
+        assert_eq!(report.resolved, 1);
+        assert_eq!(report.observed, 1, "the fixture resolution was clicked");
+        assert!(report.csv.contains("human_source"));
+        assert!(report.csv.contains(",explicit,"));
+    }
+
     #[test]
     fn agreed_only_drops_disagreements() {
         let answers = serde_json::json!({
@@ -1256,6 +1363,8 @@ mod tests {
                 at_ms: 200,
                 human_outcome: "reject".into(),
                 note: None,
+                source: HumanSource::Explicit,
+                window_ms: None,
             }));
 
         let all = export_laya(&sessions, &LayaExportOptions::default());

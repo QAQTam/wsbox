@@ -405,7 +405,50 @@ no dangerous auto-approvals in 4 resolved review(s).
 
 ### 阶段 2 —— 开启 auto-approve
 
-阈值保守起步，只对"每道题都答了、都可信、都没触发"的变更集放行。配合 `--record` 持续验证。
+不是一步打开，是一个**带默认值的否决窗口**，逐级放开：
+
+```
+变更发生
+  └─ 立刻触发 review（异步，实测中位 2.3s）
+       └─ verdict 就绪
+            └─ 弹出窗口：「自动审批模型选择：批准。请裁决」
+                 ├─ 用户点拒绝 → 记录 explicit/reject（最高价值样本）
+                 ├─ 用户点批准 → 记录 explicit/apply
+                 └─ 5s 无动作 → 记录 timeout，按模型选择继续
+```
+
+**窗口从 verdict 就绪开始算，不是从变更发生开始。** 否则用户在 2.3s 的推理期间就在看倒计时了。
+
+**沉默必须记成 `timeout`，不能记成 `approve`。** 这是整个设计里最容易做错、后果最严重的一处：如果把超时当批准，一台没人管的机器跑一晚上会产出一份"所有变更都被批准"的语料，模型学到的是"没人看 = 同意"。所以 `ResolutionRecord.source` 区分 `explicit` / `timeout`，导出默认只把 `explicit` 当标签。
+
+```
+$ wsbox-review stats --session gate
+reviews 3   observed 2   timed out 1   with fallbacks 0
+only the 2 observed one(s) are evidence; a countdown that expired is the absence of one.
+
+model said         applied  rejected  unresolved
+auto_apply               0         0           1
+review                   1         0           0
+hold                     0         1           0
+
+no dangerous auto-approvals in 2 observed review(s), but 30 are needed before relaxing the gate.
+```
+
+**晋级按风险类别分开，不是一个全局计时器：**
+
+| 类别 | 窗口 | 晋级条件 |
+|---|---|---|
+| `auto_apply`（无 hazard、无硬规则） | 5s → 2s → 0s | ≥30 个 **observed** 样本且 `dangerousAutoApprove == 0` |
+| `review`（hazard 落在不确定带） | 永远保留窗口 | 不晋级 |
+| `hold`（硬规则命中） | 从不自动，必须显式确认 | 不晋级 |
+
+全局 5s→2s→0 的问题是低风险和中等风险共用一个门槛。分开之后，"真自动"只发生在它该发生的地方。
+
+**超时只对 approve 方向生效。** 模型说 hold/review 时用户不动作 → 不落盘。沉默不该产生"拒绝"，更不该产生"放行一个模型自己都不确定的变更"——fail-closed 是自然结果，不需要额外规则。
+
+**无人值守（CI/headless）没有窗口**，退回到"只有硬规则能自动放行"，其余挂起等人。这与既有的 fail-closed 一致。
+
+**顺带产出最好的训练数据。** 显式拒绝（模型想放行、用户拦下）是"模型错了且有人发现了"，是最高价值的样本；超时是最弱的。所以 `--observed-only` 存在，导出可以按 source 分层而不是一视同仁。
 
 ### 阶段 3 —— 本地模型
 
