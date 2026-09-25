@@ -29,6 +29,28 @@ use crate::state::ChangeSetState;
 pub const DEFAULT_ENDPOINT: &str = "https://api.typesafe.ai/v1/systemone";
 pub const DEFAULT_MODEL: &str = "jev-latest";
 
+/// What a backend claims about its own probabilities.
+///
+/// This is not a formality. A hosted Jev is trained with RLCD against strictly
+/// proper scoring rules, so its probabilities are calibrated and a threshold on
+/// them means something. A self-hosted open checkpoint is not: Laya's own model
+/// card reports a mean ECE of 0.466 out of the box, improving to 0.081 only
+/// after fitting a temperature per question type on your data.
+///
+/// So the default for a self-hosted endpoint is [`CalibrationClaim::Raw`], and
+/// the router refuses to auto-apply from raw output. Claiming otherwise has to
+/// be a deliberate act performed after fitting temperatures — which is the
+/// correct order of operations, not a hoop to jump through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CalibrationClaim {
+    /// Natively calibrated; the vendor's training procedure guarantees it.
+    Native,
+    /// A calibration map was fitted on this deployment's own labelled data.
+    Fitted { source: String },
+    /// Raw model output. Thresholds do not apply.
+    Raw,
+}
+
 pub struct Jev {
     api_key: String,
     endpoint: String,
@@ -38,17 +60,34 @@ pub struct Jev {
     /// for the state plus the longest question, so this leaves room for the
     /// battery and keeps the request in the cheap part of the curve.
     diff_budget: usize,
+    calibration: CalibrationClaim,
 }
 
 impl Jev {
-    /// Reads `TYPESAFE_API_KEY`. Returns the "no key" error rather than
-    /// panicking, so the caller's fallback path is the normal one.
+    /// Reads `TYPESAFE_ENDPOINT` and `TYPESAFE_API_KEY`.
+    ///
+    /// The endpoint override is what makes a self-hosted model a drop-in: Laya's
+    /// `laya-serve` speaks the same `POST /v1/systemone` wire protocol with a
+    /// schema-identical payload, so pointing this at it is the whole
+    /// integration. A self-hosted instance usually has no auth, so a missing key
+    /// is only an error for the hosted endpoint.
+    ///
+    /// Returns the "no key" error rather than panicking, so the caller's
+    /// fallback path is the normal one.
     pub fn from_env() -> Result<Self> {
-        let api_key = std::env::var("TYPESAFE_API_KEY").map_err(|_| AssessorError::NoApiKey)?;
-        if api_key.trim().is_empty() {
-            return Err(AssessorError::NoApiKey);
+        let endpoint = non_empty(std::env::var("TYPESAFE_ENDPOINT").ok());
+        let api_key = non_empty(std::env::var("TYPESAFE_API_KEY").ok());
+
+        match (endpoint, api_key) {
+            (Some(endpoint), key) => Ok(Self::new(key.unwrap_or_default())
+                .with_endpoint(endpoint)
+                // Fail closed: a self-hosted endpoint is raw until someone fits
+                // temperatures and says otherwise. `WSBOX_REVIEW_CALIBRATION`
+                // is the deliberate act of saying otherwise.
+                .with_calibration(calibration_from_env())),
+            (None, Some(key)) => Ok(Self::new(key)),
+            (None, None) => Err(AssessorError::NoApiKey),
         }
-        Ok(Self::new(api_key))
     }
 
     pub fn new(api_key: impl Into<String>) -> Self {
@@ -58,6 +97,7 @@ impl Jev {
             model: DEFAULT_MODEL.to_string(),
             timeout: Duration::from_secs(30),
             diff_budget: 48_000,
+            calibration: CalibrationClaim::Native,
         }
     }
 
@@ -78,6 +118,11 @@ impl Jev {
 
     pub fn with_diff_budget(mut self, bytes: usize) -> Self {
         self.diff_budget = bytes;
+        self
+    }
+
+    pub fn with_calibration(mut self, claim: CalibrationClaim) -> Self {
+        self.calibration = claim;
         self
     }
 
@@ -126,9 +171,13 @@ impl Jev {
             .build()
             .into();
 
-        let mut response = agent
-            .post(&self.endpoint)
-            .header("Authorization", &format!("Bearer {}", self.api_key))
+        let mut request = agent.post(&self.endpoint);
+        // A self-hosted instance usually runs without auth, so the header is
+        // only sent when there is something to send.
+        if !self.api_key.is_empty() {
+            request = request.header("Authorization", &format!("Bearer {}", self.api_key));
+        }
+        let mut response = request
             .header("Content-Type", "application/json")
             .send_json(body)
             .map_err(|error| match error {
@@ -153,6 +202,24 @@ impl Jev {
             ))),
         }
     }
+}
+
+/// Read the operator's explicit claim about a self-hosted endpoint.
+///
+/// Defaults to `raw`, because the safe assumption about an arbitrary checkpoint
+/// is that its numbers are not yet meaningful.
+fn calibration_from_env() -> CalibrationClaim {
+    match non_empty(std::env::var("WSBOX_REVIEW_CALIBRATION").ok()).as_deref() {
+        Some("native") => CalibrationClaim::Native,
+        Some(value) if value.starts_with("fitted:") => CalibrationClaim::Fitted {
+            source: value.trim_start_matches("fitted:").to_string(),
+        },
+        _ => CalibrationClaim::Raw,
+    }
+}
+
+fn non_empty(value: Option<String>) -> Option<String> {
+    value.filter(|text| !text.trim().is_empty())
 }
 
 fn excerpt(text: &str) -> String {
@@ -197,8 +264,17 @@ impl Assessor for Jev {
             .and_then(Value::as_str)
             .unwrap_or(&self.model)
             .to_string();
-        let calibration = Calibration::Calibrated {
-            source: model_version,
+        // What the backend claims about itself decides whether the router may
+        // threshold its numbers at all. A self-hosted checkpoint that has not
+        // been temperature-fitted says `Raw`, and raw answers never auto-apply.
+        let calibration = match &self.calibration {
+            CalibrationClaim::Native => Calibration::Calibrated {
+                source: model_version,
+            },
+            CalibrationClaim::Fitted { source } => Calibration::Calibrated {
+                source: format!("{model_version}+{source}"),
+            },
+            CalibrationClaim::Raw => Calibration::Uncalibrated,
         };
 
         let answers = response
@@ -213,22 +289,36 @@ impl Assessor for Jev {
                 // correct: the router turns a missing answer into a human.
                 continue;
             };
+
+            // The full distribution, ordered to match the question's own option
+            // order. This is the training target: distilling a decision model
+            // needs the distribution, not just the argmax, and dropping it here
+            // would make the corpus unusable for that later.
+            let distribution = ordered_distribution(raw, &question.kind);
+
             let parsed = match &question.kind {
-                QuestionKind::Boolean => raw
-                    .get("noul")
-                    .and_then(Value::as_f64)
-                    .map(|probability| Answer::boolean(probability, calibration.clone())),
+                QuestionKind::Boolean => {
+                    raw.get("noul")
+                        .and_then(Value::as_f64)
+                        .map(|probability| Answer {
+                            distribution,
+                            ..Answer::boolean(probability, calibration.clone())
+                        })
+                }
                 QuestionKind::Rubric { levels } => {
                     raw.get("score").and_then(Value::as_f64).map(|score| {
                         let confidence = raw
                             .get("confidence")
                             .and_then(Value::as_f64)
                             .unwrap_or_default();
-                        Answer::level(
-                            battery::normalise_level(score, levels.len()),
-                            confidence,
-                            calibration.clone(),
-                        )
+                        Answer {
+                            distribution,
+                            ..Answer::level(
+                                battery::normalise_level(score, levels.len()),
+                                confidence,
+                                calibration.clone(),
+                            )
+                        }
                     })
                 }
                 QuestionKind::Category { .. } => {
@@ -237,7 +327,10 @@ impl Assessor for Jev {
                             .get("confidence")
                             .and_then(Value::as_f64)
                             .unwrap_or_default();
-                        Answer::category(choice, confidence, calibration.clone())
+                        Answer {
+                            distribution,
+                            ..Answer::category(choice, confidence, calibration.clone())
+                        }
                     })
                 }
             };
@@ -248,6 +341,60 @@ impl Assessor for Jev {
 
         Ok(out)
     }
+}
+
+/// Pull `probabilities` out of a response and order it to match the question.
+///
+/// The wire format keys the distribution by label — the option names for a
+/// choice, `"0".."n"` for a score — while a training target is a plain vector.
+/// Ordering it here, against the question the request was built from, is what
+/// makes the two agree.
+///
+/// A `noul` is the exception: neither Jev nor Laya returns a distribution for
+/// one, only the scalar `noul` probability. It is reconstructed as
+/// `[1 - p, p]`, which is exact for a binary rather than an approximation — but
+/// it does mean a noul carries strictly less information than a choice, and a
+/// corpus built from nouls cannot teach a distribution the teacher never had.
+fn ordered_distribution(raw: &Value, kind: &QuestionKind) -> Option<Vec<f64>> {
+    let probabilities = raw.get("probabilities").and_then(Value::as_object);
+
+    let ordered = match kind {
+        QuestionKind::Boolean => {
+            if let Some(probabilities) = probabilities {
+                vec![
+                    probabilities.get("false").and_then(Value::as_f64)?,
+                    probabilities.get("true").and_then(Value::as_f64)?,
+                ]
+            } else {
+                let yes = raw.get("noul").and_then(Value::as_f64)?;
+                vec![1.0 - yes, yes]
+            }
+        }
+        QuestionKind::Rubric { levels } => {
+            let probabilities = probabilities?;
+            (0..levels.len())
+                .map(|index| {
+                    probabilities
+                        .get(&index.to_string())
+                        .and_then(Value::as_f64)
+                        .unwrap_or(0.0)
+                })
+                .collect()
+        }
+        QuestionKind::Category { options } => {
+            let probabilities = probabilities?;
+            options
+                .iter()
+                .map(|option| {
+                    probabilities
+                        .get(option)
+                        .and_then(Value::as_f64)
+                        .unwrap_or(0.0)
+                })
+                .collect()
+        }
+    };
+    Some(ordered)
 }
 
 #[cfg(test)]

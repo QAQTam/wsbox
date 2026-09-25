@@ -85,9 +85,13 @@ pub struct ReviewRecord {
     #[serde(default)]
     pub ledger_head: Option<String>,
     pub precomputed: PrecomputedFacts,
-    /// The concatenated diffs of the change set under review.
+    /// The change set under review, per file.
+    ///
+    /// Stored structurally rather than as one concatenated blob because the
+    /// training exporter has to rebuild the exact `state` that was sent, and a
+    /// flattened string cannot be taken apart again.
     #[serde(default)]
-    pub diff: Option<String>,
+    pub changes: Vec<crate::state::ChangeSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -429,7 +433,7 @@ fn build_row(
         facts.any_diff_truncated.to_string(),
     );
 
-    let diff = record.diff.clone().unwrap_or_default();
+    let diff = concat_diffs(&record.changes).unwrap_or_default();
     row.insert("diff_bytes".into(), diff.len().to_string());
     row.insert("diff_sha256".into(), hex(&sha256(diff.as_bytes())));
     if options.include_diffs {
@@ -508,6 +512,295 @@ fn hex(bytes: &[u8]) -> String {
         out.push(DIGITS[(byte & 0x0f) as usize] as char);
     }
     out
+}
+
+/* ------------------------------ laya training ---------------------------- */
+
+/// One training case in the format Laya's fine-tuning loop consumes.
+///
+/// Laya is trained with a proper-scoring-rule reward against a **full
+/// distribution** per question, not an argmax label — see
+/// `build_training_item` in the official notebook, where the target is
+/// `[gold["probabilities"][k] for k in keys]`. That is why the assessor keeps
+/// `Answer::distribution` instead of only the winning option: dropping it here
+/// would make the corpus unusable for exactly the thing it is collected for.
+#[derive(Debug, Clone, Serialize)]
+pub struct LayaCase {
+    pub id: String,
+    /// The state as it was sent to the assessor.
+    pub state: crate::state::ChangeSetState,
+    /// The battery, in the same wire shape the request used.
+    pub questions: serde_json::Value,
+    /// `{question_id: {"probabilities": {label: p}}}`.
+    pub gold: serde_json::Value,
+    /// Provenance, ignored by the trainer but useful when the corpus is audited
+    /// or split.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub meta: Option<LayaMeta>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LayaMeta {
+    pub session_id: String,
+    pub review_id: u64,
+    pub battery_fingerprint: String,
+    pub model: Option<String>,
+    pub human_outcome: Option<String>,
+    /// Whether the human agreed with the model's decision. A distillation run
+    /// wants this to filter; a calibration run wants it as the label.
+    pub human_agreed: Option<bool>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LayaExportOptions {
+    /// Keep only cases a person resolved.
+    pub resolved_only: bool,
+    /// Keep only cases where the human agreed with the model. Distilling a
+    /// disagreement teaches the model to reproduce a decision that was
+    /// rejected.
+    pub agreed_only: bool,
+    /// Drop answers whose calibration is not trustworthy, rather than shipping
+    /// an uncalibrated number as if it were a target.
+    pub trustworthy_only: bool,
+}
+
+impl Default for LayaExportOptions {
+    fn default() -> Self {
+        Self {
+            resolved_only: false,
+            agreed_only: false,
+            trustworthy_only: true,
+        }
+    }
+}
+
+/// Build one case per review, or `None` when the review has nothing usable.
+pub fn laya_case(
+    session_id: &str,
+    record: &ReviewRecord,
+    resolution: Option<&ResolutionRecord>,
+    options: &LayaExportOptions,
+) -> Option<LayaCase> {
+    if options.resolved_only && resolution.is_none() {
+        return None;
+    }
+
+    let battery = battery::change_set();
+    let rationale = &record.decision["rationale"];
+    let assessed = &record.assessed_action;
+
+    let human_outcome = resolution.map(|r| r.human_outcome.clone());
+    let human_agreed = human_outcome.as_ref().map(|outcome| {
+        let human_applied = outcome == "apply";
+        let model_applied = assessed == "auto_apply";
+        human_applied == model_applied
+    });
+
+    if options.agreed_only && human_agreed != Some(true) {
+        return None;
+    }
+
+    let mut questions = serde_json::Map::new();
+    let mut gold = serde_json::Map::new();
+
+    for question in &battery.questions {
+        let answer = &rationale["answers"][&question.id];
+        if answer.is_null() {
+            continue;
+        }
+        // An untrustworthy number is not a target. Including it would teach the
+        // model to reproduce an answer the router itself refuses to act on.
+        let calibration = answer["calibration"]["kind"].as_str().unwrap_or("");
+        if options.trustworthy_only && calibration == "uncalibrated" {
+            continue;
+        }
+
+        let labels: Vec<String> = match &question.kind {
+            crate::question::QuestionKind::Boolean => {
+                vec!["false".to_string(), "true".to_string()]
+            }
+            crate::question::QuestionKind::Rubric { levels } => {
+                (0..levels.len()).map(|index| index.to_string()).collect()
+            }
+            crate::question::QuestionKind::Category { options } => options.clone(),
+        };
+
+        let values: Vec<f64> = match answer["distribution"].as_array() {
+            Some(distribution) => distribution
+                .iter()
+                .filter_map(serde_json::Value::as_f64)
+                .collect(),
+            // An `Exact` answer — everything the rules pass produces — is a
+            // point mass with no distribution attached. Materialising it here
+            // rather than dropping it matters: those are the only *free, exact*
+            // labels in the corpus, produced at any scale with no model and no
+            // human. Throwing them away would leave only distilled ones.
+            None if calibration == "exact" => match point_mass(&question.kind, answer) {
+                Some(mass) => mass,
+                None => continue,
+            },
+            None => continue,
+        };
+        if values.len() != labels.len() {
+            continue;
+        }
+
+        questions.insert(question.id.clone(), question_to_wire(question));
+        gold.insert(
+            question.id.clone(),
+            serde_json::json!({
+                "probabilities": labels
+                    .iter()
+                    .cloned()
+                    .zip(values)
+                    .collect::<BTreeMap<String, f64>>(),
+            }),
+        );
+    }
+
+    if gold.is_empty() {
+        return None;
+    }
+
+    Some(LayaCase {
+        id: format!("{session_id}#{}", record.review_id),
+        state: crate::state::ChangeSetState {
+            task: record.task.clone(),
+            changes: record.changes.clone(),
+            precomputed: record.precomputed.clone(),
+        },
+        questions: serde_json::Value::Object(questions),
+        gold: serde_json::Value::Object(gold),
+        meta: Some(LayaMeta {
+            session_id: session_id.to_string(),
+            review_id: record.review_id,
+            battery_fingerprint: record.battery_fingerprint.clone(),
+            model: rationale["model"].as_str().map(str::to_string),
+            human_outcome,
+            human_agreed,
+        }),
+    })
+}
+
+/// Turn an exact answer into the point mass it represents.
+fn point_mass(
+    kind: &crate::question::QuestionKind,
+    answer: &serde_json::Value,
+) -> Option<Vec<f64>> {
+    match kind {
+        crate::question::QuestionKind::Boolean => {
+            let yes = answer["probability"].as_f64()?;
+            Some(vec![1.0 - yes, yes])
+        }
+        crate::question::QuestionKind::Rubric { levels } => {
+            if levels.is_empty() {
+                return None;
+            }
+            let level = answer["level"].as_f64()?;
+            let mut mass = vec![0.0; levels.len()];
+            let index = (level * (levels.len() - 1) as f64).round() as usize;
+            *mass.get_mut(index.min(levels.len() - 1))? = 1.0;
+            Some(mass)
+        }
+        crate::question::QuestionKind::Category { options } => {
+            let chosen = answer["category"].as_str()?;
+            let mut mass = vec![0.0; options.len()];
+            let index = options.iter().position(|option| option == chosen)?;
+            *mass.get_mut(index)? = 1.0;
+            Some(mass)
+        }
+    }
+}
+
+/// A question in the same wire shape the request used, so the corpus and the
+/// live request cannot drift apart.
+fn question_to_wire(question: &crate::question::Question) -> serde_json::Value {
+    match &question.kind {
+        crate::question::QuestionKind::Boolean => serde_json::json!({
+            "type": "noul",
+            "instructions": question.instructions,
+        }),
+        crate::question::QuestionKind::Rubric { levels } => serde_json::json!({
+            "type": "score",
+            "instructions": question.instructions,
+            "criteria": levels,
+        }),
+        crate::question::QuestionKind::Category { options } => serde_json::json!({
+            "type": "choice",
+            "instructions": question.instructions,
+            "criteria": options
+                .iter()
+                .map(|option| (option.clone(), serde_json::Value::Null))
+                .collect::<serde_json::Map<String, serde_json::Value>>(),
+        }),
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LayaExportReport {
+    pub jsonl: String,
+    pub cases: usize,
+    pub skipped: usize,
+    pub questions: usize,
+}
+
+/// Export every usable review as one JSONL line in Laya's training format.
+pub fn export_laya(sessions: &[SessionLog], options: &LayaExportOptions) -> LayaExportReport {
+    let mut lines = Vec::new();
+    let mut skipped = 0usize;
+    let mut questions = 0usize;
+
+    for session in sessions {
+        let resolutions: BTreeMap<u64, &ResolutionRecord> = session
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                LogEntry::Resolution(resolution) => Some((resolution.review_id, resolution)),
+                LogEntry::Review(_) => None,
+            })
+            .collect();
+
+        let mut reviews: Vec<&ReviewRecord> = session
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                LogEntry::Review(record) => Some(record.as_ref()),
+                LogEntry::Resolution(_) => None,
+            })
+            .collect();
+        reviews.sort_by_key(|record| (record.at_ms, record.review_id));
+
+        for record in reviews {
+            match laya_case(
+                &session.session_id,
+                record,
+                resolutions.get(&record.review_id).copied(),
+                options,
+            ) {
+                Some(case) => {
+                    questions += case.gold.as_object().map(|g| g.len()).unwrap_or(0);
+                    match serde_json::to_string(&case) {
+                        Ok(line) => lines.push(line),
+                        Err(_) => skipped += 1,
+                    }
+                }
+                None => skipped += 1,
+            }
+        }
+    }
+
+    LayaExportReport {
+        cases: lines.len(),
+        skipped,
+        questions,
+        jsonl: if lines.is_empty() {
+            String::new()
+        } else {
+            lines.join("\n") + "\n"
+        },
+    }
 }
 
 /* ---------------------------------- csv ---------------------------------- */
@@ -697,7 +990,13 @@ mod tests {
                 files_changed: 1,
                 ..Default::default()
             },
-            diff: Some("@@ -1 +1 @@\n-a\n+b\n".into()),
+            changes: vec![crate::state::ChangeSummary {
+                path: "a.py".into(),
+                op: wsbox::protocol::Op::Modify,
+                before_bytes: Some(1),
+                after_bytes: Some(1),
+                diff: Some("@@ -1 +1 @@\n-a\n+b\n".into()),
+            }],
         }))
     }
 
@@ -802,5 +1101,192 @@ mod tests {
         assert_eq!(csv_field("a,b"), "\"a,b\"");
         assert_eq!(csv_field("say \"hi\""), "\"say \"\"hi\"\"\"");
         assert_eq!(csv_field("two\nlines"), "\"two\nlines\"");
+    }
+
+    /* ----------------------------- laya export --------------------------- */
+
+    fn with_answers(mut record: ReviewRecord, answers: serde_json::Value) -> ReviewRecord {
+        record.decision["rationale"]["answers"] = answers;
+        record
+    }
+
+    fn answer(
+        value: serde_json::Value,
+        calibration: &str,
+        distribution: Option<Vec<f64>>,
+    ) -> serde_json::Value {
+        let mut object = value.as_object().cloned().unwrap_or_default();
+        object.insert(
+            "calibration".into(),
+            serde_json::json!({ "kind": calibration }),
+        );
+        if let Some(distribution) = distribution {
+            object.insert("distribution".into(), serde_json::json!(distribution));
+        }
+        serde_json::Value::Object(object)
+    }
+
+    fn laya_session(answers: serde_json::Value) -> Vec<SessionLog> {
+        let LogEntry::Review(record) = review(1, "auto_apply", 100) else {
+            unreachable!()
+        };
+        vec![SessionLog {
+            session_id: "s1".into(),
+            entries: vec![LogEntry::Review(Box::new(with_answers(*record, answers)))],
+        }]
+    }
+
+    #[test]
+    fn laya_export_emits_one_case_with_distributions() {
+        let answers = serde_json::json!({
+            "lost_content": answer(
+                serde_json::json!({"probability": 0.2}),
+                "calibrated",
+                Some(vec![0.8, 0.2]),
+            ),
+            "category": answer(
+                serde_json::json!({"category": "fix"}),
+                "calibrated",
+                Some(vec![0.1, 0.2, 0.3, 0.4, 0.0, 0.0]),
+            ),
+        });
+        let report = export_laya(&laya_session(answers), &LayaExportOptions::default());
+        assert_eq!(report.cases, 1);
+        assert_eq!(report.questions, 2);
+
+        let case: serde_json::Value = serde_json::from_str(report.jsonl.trim()).expect("json");
+        assert_eq!(case["gold"]["lost_content"]["probabilities"]["true"], 0.2);
+        assert_eq!(case["gold"]["lost_content"]["probabilities"]["false"], 0.8);
+    }
+
+    /// The official training loop reads the target as
+    /// `[gold["probabilities"][k] for k in keys]`, where `keys` comes from the
+    /// question's own criteria. If the two ever disagree the corpus silently
+    /// trains on misaligned labels, so the alignment is asserted rather than
+    /// assumed.
+    #[test]
+    fn laya_label_keys_match_the_question_criteria() {
+        let answers = serde_json::json!({
+            "lost_content": answer(
+                serde_json::json!({"probability": 0.2}), "calibrated", Some(vec![0.8, 0.2])),
+            "severity": answer(
+                serde_json::json!({"level": 0.5}), "calibrated", Some(vec![0.1, 0.2, 0.3, 0.4])),
+            "category": answer(
+                serde_json::json!({"category": "fix"}), "calibrated",
+                Some(vec![0.1, 0.2, 0.3, 0.4, 0.0, 0.0])),
+        });
+        let report = export_laya(&laya_session(answers), &LayaExportOptions::default());
+        let case: serde_json::Value = serde_json::from_str(report.jsonl.trim()).expect("json");
+
+        for (id, gold) in case["gold"].as_object().expect("gold") {
+            let question = &case["questions"][id];
+            let probabilities = gold["probabilities"].as_object().expect("probs");
+            let expected: Vec<String> = match question["type"].as_str().expect("type") {
+                "noul" => vec!["false".into(), "true".into()],
+                "score" => (0..question["criteria"].as_array().unwrap().len())
+                    .map(|i| i.to_string())
+                    .collect(),
+                _ => question["criteria"]
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .cloned()
+                    .collect(),
+            };
+            let mut got: Vec<String> = probabilities.keys().cloned().collect();
+            got.sort();
+            let mut expected = expected;
+            expected.sort();
+            assert_eq!(got, expected, "label keys drifted for `{id}`");
+        }
+    }
+
+    /// Everything the rules pass produces is a point mass with no distribution
+    /// attached. Those are the only free, exact labels in the corpus, so they
+    /// must be materialised rather than dropped.
+    #[test]
+    fn exact_answers_become_point_masses() {
+        let answers = serde_json::json!({
+            "lost_content": answer(serde_json::json!({"probability": 0.0}), "exact", None),
+            "leftover_debug": answer(serde_json::json!({"probability": 1.0}), "exact", None),
+            "category": answer(serde_json::json!({"category": "formatting"}), "exact", None),
+        });
+        let report = export_laya(&laya_session(answers), &LayaExportOptions::default());
+        let case: serde_json::Value = serde_json::from_str(report.jsonl.trim()).expect("json");
+
+        assert_eq!(case["gold"]["lost_content"]["probabilities"]["false"], 1.0);
+        assert_eq!(case["gold"]["leftover_debug"]["probabilities"]["true"], 1.0);
+        assert_eq!(case["gold"]["category"]["probabilities"]["formatting"], 1.0);
+    }
+
+    #[test]
+    fn uncalibrated_answers_are_excluded_by_default() {
+        let answers = serde_json::json!({
+            "lost_content": answer(
+                serde_json::json!({"probability": 0.2}), "uncalibrated", Some(vec![0.8, 0.2])),
+        });
+        let report = export_laya(&laya_session(answers), &LayaExportOptions::default());
+        assert_eq!(report.cases, 0, "an uncalibrated number is not a target");
+
+        let included = export_laya(
+            &laya_session(serde_json::json!({
+                "lost_content": answer(
+                    serde_json::json!({"probability": 0.2}), "uncalibrated", Some(vec![0.8, 0.2])),
+            })),
+            &LayaExportOptions {
+                trustworthy_only: false,
+                ..LayaExportOptions::default()
+            },
+        );
+        assert_eq!(included.cases, 1);
+    }
+
+    #[test]
+    fn agreed_only_drops_disagreements() {
+        let answers = serde_json::json!({
+            "lost_content": answer(
+                serde_json::json!({"probability": 0.1}), "calibrated", Some(vec![0.9, 0.1])),
+        });
+        // The model said auto_apply; the person rejected.
+        let mut sessions = laya_session(answers);
+        sessions[0]
+            .entries
+            .push(LogEntry::Resolution(ResolutionRecord {
+                review_id: 1,
+                at_ms: 200,
+                human_outcome: "reject".into(),
+                note: None,
+            }));
+
+        let all = export_laya(&sessions, &LayaExportOptions::default());
+        assert_eq!(all.cases, 1);
+
+        let agreed = export_laya(
+            &sessions,
+            &LayaExportOptions {
+                agreed_only: true,
+                ..LayaExportOptions::default()
+            },
+        );
+        assert_eq!(
+            agreed.cases, 0,
+            "training on a disagreement teaches the model to reproduce a rejected decision"
+        );
+    }
+
+    #[test]
+    fn laya_export_carries_provenance() {
+        let answers = serde_json::json!({
+            "lost_content": answer(
+                serde_json::json!({"probability": 0.1}), "calibrated", Some(vec![0.9, 0.1])),
+        });
+        let report = export_laya(&laya_session(answers), &LayaExportOptions::default());
+        let case: serde_json::Value = serde_json::from_str(report.jsonl.trim()).expect("json");
+        assert_eq!(case["meta"]["sessionId"], "s1");
+        assert_eq!(case["meta"]["reviewId"], 1);
+        assert!(
+            case["meta"]["batteryFingerprint"].is_string(),
+            "a corpus that cannot be tied to a battery version is not reusable"
+        );
     }
 }

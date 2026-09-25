@@ -146,6 +146,32 @@ struct ExportArgs {
     /// Embed the diffs. Off gives a compact audit-only table.
     #[arg(long)]
     include_diffs: bool,
+
+    /// `csv` for the auditable table, `laya` for a fine-tuning corpus.
+    #[arg(long, value_enum, default_value_t = FormatArg::Csv)]
+    format: FormatArg,
+
+    /// laya: keep only reviews a person resolved.
+    #[arg(long)]
+    resolved_only: bool,
+
+    /// laya: keep only reviews where the person agreed with the model. Training
+    /// on disagreements teaches the model to reproduce a rejected decision.
+    #[arg(long)]
+    agreed_only: bool,
+
+    /// laya: include answers the router refuses to threshold. Off by default —
+    /// an uncalibrated number is not a target.
+    #[arg(long)]
+    include_uncalibrated: bool,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum FormatArg {
+    /// Auditable table with a tamper-evident row chain.
+    Csv,
+    /// One JSON object per case, in the shape Laya's fine-tuning loop reads.
+    Laya,
 }
 
 #[derive(clap::Args)]
@@ -549,29 +575,62 @@ fn run_export(args: &ExportArgs) -> Result<(), String> {
     use std::io::Write;
 
     let logs = collect_logs(args)?;
-    let options = wsbox_review::export::ExportOptions {
-        include_diffs: args.include_diffs,
-    };
-    let report = wsbox_review::export::export(&logs, &options)?;
 
-    match &args.out {
-        Some(path) => {
-            std::fs::write(path, &report.csv)
-                .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
-            eprintln!(
-                "{} row(s), {} resolved, {} session(s) -> {}",
-                report.rows,
-                report.resolved,
-                logs.len(),
-                path.display()
-            );
-            eprintln!("chain head: {}", report.head);
+    match args.format {
+        FormatArg::Csv => {
+            let options = wsbox_review::export::ExportOptions {
+                include_diffs: args.include_diffs,
+            };
+            let report = wsbox_review::export::export(&logs, &options)?;
+            match &args.out {
+                Some(path) => {
+                    std::fs::write(path, &report.csv)
+                        .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
+                    eprintln!(
+                        "{} row(s), {} resolved, {} session(s) -> {}",
+                        report.rows,
+                        report.resolved,
+                        logs.len(),
+                        path.display()
+                    );
+                    eprintln!("chain head: {}", report.head);
+                }
+                None => {
+                    let stdout = std::io::stdout();
+                    stdout
+                        .lock()
+                        .write_all(report.csv.as_bytes())
+                        .map_err(|error| error.to_string())?;
+                }
+            }
         }
-        None => {
-            let stdout = std::io::stdout();
-            let mut out = stdout.lock();
-            out.write_all(report.csv.as_bytes())
-                .map_err(|error| error.to_string())?;
+        FormatArg::Laya => {
+            let options = wsbox_review::export::LayaExportOptions {
+                resolved_only: args.resolved_only,
+                agreed_only: args.agreed_only,
+                trustworthy_only: !args.include_uncalibrated,
+            };
+            let report = wsbox_review::export::export_laya(&logs, &options);
+            match &args.out {
+                Some(path) => {
+                    std::fs::write(path, &report.jsonl)
+                        .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
+                    eprintln!(
+                        "{} case(s), {} question(s), {} skipped -> {}",
+                        report.cases,
+                        report.questions,
+                        report.skipped,
+                        path.display()
+                    );
+                }
+                None => {
+                    let stdout = std::io::stdout();
+                    stdout
+                        .lock()
+                        .write_all(report.jsonl.as_bytes())
+                        .map_err(|error| error.to_string())?;
+                }
+            }
         }
     }
     Ok(())
@@ -721,7 +780,7 @@ fn record(
         policy: serde_json::to_value(&policy_of(args)?).map_err(|error| error.to_string())?,
         ledger_head: session.ledger_head().ok(),
         precomputed: outcome.state.precomputed.clone(),
-        diff: wsbox_review::export::concat_diffs(&outcome.state.changes),
+        changes: outcome.state.changes.clone(),
     };
 
     let mut file = std::fs::OpenOptions::new()

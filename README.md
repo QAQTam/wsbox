@@ -252,6 +252,11 @@ Each row carries a digest chained to the previous one, so editing a cell breaks
 the chain and `verify` names the row. Every row also points at the wsbox ledger
 head it was taken under, so it traces back to the change set it describes.
 
+The same records export in the shape a local decision model's fine-tuning loop
+reads (`--format laya`), which is the point of collecting them — see
+[`docs/laya.md`](docs/laya.md). The hosted model is what makes the corpus
+possible; it is not the destination.
+
 The schema keeps two kinds of label apart, because they are not
 interchangeable:
 
@@ -399,5 +404,5 @@ Not yet:
 - landlock/seccomp enforcement layered on top of the mount isolation
 - chunk-level storage for the large-file-rewritten-repeatedly case
 - automatic retention: `gc` is currently manual
-- the hosted (Jev) assessor has not been exercised against the live API
 - shadow mode: today the caller just ignores `may_auto_apply()`
+- a local decision model has not been trained yet (see `docs/laya.md`)
