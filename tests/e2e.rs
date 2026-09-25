@@ -1140,6 +1140,93 @@ fn a_session_id_cannot_escape_the_ledger_directory() {
     );
 }
 
+/// Two writers on one session used to lose an index update and write two
+/// ledger entries claiming the same position in the chain. The lock serialises
+/// them and each writer re-reads the state it is about to extend.
+#[test]
+fn concurrent_exec_calls_do_not_lose_updates() {
+    if !overlay_available() {
+        skip("overlayfs unavailable in a user namespace");
+        return;
+    }
+
+    let fixture = Fixture::new();
+    fixture.write("a.txt", "a\n");
+    fixture.write("b.txt", "b\n");
+    drop(fixture.open("concurrent", Mode::Overlay));
+    let ledger_dir = fixture.ledger.path().to_path_buf();
+
+    // Both writers load the session (and its ledger position) before either
+    // appends; the sleep inside the command keeps them overlapping.
+    let handles: Vec<_> = [("call-a", "a.txt"), ("call-b", "b.txt")]
+        .into_iter()
+        .map(|(call, file)| {
+            let ledger_dir = ledger_dir.clone();
+            std::thread::spawn(move || {
+                let mut session = Session::load(&ledger_dir, "concurrent").expect("load");
+                session
+                    .exec(&ExecParams {
+                        session: session.meta.id.clone(),
+                        call: call.to_string(),
+                        cwd: session.meta.workspace.clone(),
+                        argv: vec![
+                            "bash".into(),
+                            "-lc".into(),
+                            format!("sleep 0.2; echo changed > {file}"),
+                        ],
+                        spec: Spec {
+                            enabled: true,
+                            writable_roots: vec![session.meta.workspace.clone()],
+                            ..Spec::default()
+                        },
+                        ledger_dir: None,
+                        timeout_ms: Some(60_000),
+                        max_output_bytes: None,
+                    })
+                    .expect("exec")
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.join().expect("writer thread");
+    }
+
+    let session = Session::load(&ledger_dir, "concurrent").expect("load");
+    let entries = wsbox::ledger::read_all(&session.ledger_path()).expect("ledger");
+    assert_eq!(entries.len(), 2, "both calls must be recorded");
+    assert_eq!(
+        entries.iter().map(|entry| entry.seq).collect::<Vec<_>>(),
+        vec![0, 1],
+        "each entry must claim its own position"
+    );
+    assert_eq!(
+        wsbox::ledger::verify(&session.ledger_path()).expect("the chain must verify"),
+        2
+    );
+
+    // Both files are pending, each attributed to its own call.
+    let mut changes = session.changes().expect("changes");
+    changes.sort_by(|a, b| a.path.cmp(&b.path));
+    assert_eq!(
+        changes
+            .iter()
+            .map(|change| change.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["a.txt", "b.txt"]
+    );
+    let ledger = session
+        .query_ledger(&LedgerQueryParams {
+            session: session.meta.id.clone(),
+            ledger_dir: None,
+            call: None,
+            path: None,
+            since_seq: None,
+            limit: None,
+        })
+        .expect("query");
+    assert_eq!(ledger.entries.len(), 2);
+}
+
 /* ------------------------------ structural ------------------------------ */
 
 /// overlayfs materialises a directory in `upper/` as soon as anything inside it

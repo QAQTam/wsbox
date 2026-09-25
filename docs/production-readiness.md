@@ -13,7 +13,7 @@
 验收命令：
 
 ```bash
-cargo test --workspace --all-features    # 当前 135 项全绿
+cargo test --workspace --all-features    # 当前 136 项全绿
 cargo clippy --workspace --all-features --all-targets
 ```
 
@@ -43,6 +43,7 @@ DoD 的**主干已经达成**：本轮把 bash 常见的写文件方式逐条钉
 | 文件名含 `\`（Unix 普通字节） | 路径不失真，`apply` 生效 | `a_backslash_in_a_filename_is_not_a_directory_separator` |
 | 文件名不是合法 UTF-8 | 两个不同文件**不塌缩**，`apply`/`restore` 按原始字节生效 | `non_utf8_filenames_are_distinct_and_applied` |
 | 文件 > 8 MiB 改写 | `diff` 为 null + `diffTruncated` + warning，但 sha/apply/restore 全部正确 | `a_file_too_large_to_diff_is_still_reproducible` |
+| 同一 session 两个 `exec` 并发 | 账本两条 seq 0/1、链可验证、index 不丢更新 | `concurrent_exec_calls_do_not_lose_updates` |
 | `sed -i`（临时文件 + rename） | 报一个 modify | `atomic_rename_is_one_modify` |
 | 二进制改写 | 报 modify，`diff: null` | `binary_change_is_reported_without_a_text_diff` |
 | `chmod` | 报 chmod 并落到真实文件 | `a_mode_change_is_journaled_and_applied`、`snapshot_mode_reports_a_mode_change` |
@@ -81,6 +82,7 @@ session id 不能借 `../` 写到账本目录之外（`a_session_id_cannot_escap
 | 11 | baseline 目录在状态比较中按“不存在”处理 | 目录 whiteout 被静默丢弃，`rm -rf dir` 报 0 个变更 | 目录作为有类型、无内容的状态参与比较，并可按 baseline 重建 |
 | 12 | 非 UTF-8 文件名被 `to_string_lossy` 压成 U+FFFD | 两个不同文件塌缩成一条 `add �`，`apply` 报"content for � is missing" | 路径 key 字节精确：UTF-8 名字即自身，否则 `!hex:<原始字节>`；marker 也参与转义，保证单射（`docs/protocol.md`） |
 | 13 | 大文件被整体读进内存做 diff；且 `diff::unified` 把 `None` 当空内容 | GB 级文件 OOM；涨过阈值的文件会被渲染成"整个文件被删除"的假 diff；`before_state` 还把读不出来的 baseline 当成不存在，变更类型误判为 add | 超过 8 MiB 不读入内存（CAS 仍流式写入），缺失内容时**不渲染** diff 并置 `diffTruncated` + warning；baseline 用 `symlink_metadata` 判存在、流式 `hash_path` 算 sha |
+| 14 | `index.json` 读-改-写、`ledger.jsonl` 追加都没有锁 | 同一 session 并发 `exec`：丢一次 index 更新，两条账本条目声明同一个 `seq`，哈希链直接断掉 | `SessionLock`（`flock`，无新依赖）保护 exec/apply/restore/gc，且**取锁后重新读盘**，第二个写者基于第一个的结果继续；负向验证过：去掉锁该测试必失败 |
 
 ---
 
@@ -109,8 +111,8 @@ README 已承认（fanotify/FUSE 未做）。对 DoD 来说这是"定义边界"�
 
 **4. 无守护进程、无并发会话保护。** 每次 `exec` 都是 fork + unshare + mount overlay；
 同一 workspace 上两个 session 各自持有 overlay，`apply` 会互相覆盖且无人检测。
-**5. 账本与索引无锁。** `ledger.jsonl` 追加、`index.json` 读-改-写都没有文件锁；
-同一 session 两个进程并发 `exec` 会交错或丢更新。
+**5. 账本与索引无锁 —— 本轮已修复。** 见 §3 第 14 条。剩下的是**跨 session**的互斥：
+两个 session 指向同一个 workspace 时，`apply` 仍会互相覆盖，这需要 workspace 级锁或 daemon 来定。
 **6. 崩溃后无 reconcile。** 调用中途进程被杀：upper 里有已发生的写入，
 但账本没有对应条目，下一次调用会把它们算到下一次头上（125 那类问题的近亲）。
 需要在 `open`/`exec` 时检测"上次未完成的调用"。

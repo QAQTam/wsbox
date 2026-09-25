@@ -63,6 +63,48 @@ pub struct Session {
     ledger: Ledger,
 }
 
+/// Exclusive lock over a session's mutable state.
+///
+/// `index.json` is a read-modify-write file and `ledger.jsonl` carries a hash
+/// chain whose next `seq`/`prev` come from the last line on disk, so two `exec`
+/// calls in parallel would lose an index update and write two entries claiming
+/// the same position in the chain. Holding this for the whole of a mutating
+/// operation serialises them; the state is re-read after acquiring it, so the
+/// second writer extends the first rather than clobbering it.
+///
+/// `flock` is advisory and per open-file-description, which is what makes it
+/// work between processes and between threads of one process — each `acquire`
+/// opens its own description. It is released when the guard drops.
+#[derive(Debug)]
+pub struct SessionLock {
+    file: std::fs::File,
+}
+
+impl SessionLock {
+    pub fn acquire(root: &Path) -> Result<Self> {
+        let path = root.join(".lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .map_err(|error| Error::io(&path, error))?;
+        let result = unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&file), libc::LOCK_EX) };
+        if result != 0 {
+            return Err(Error::io(&path, std::io::Error::last_os_error()));
+        }
+        Ok(Self { file })
+    }
+}
+
+impl Drop for SessionLock {
+    fn drop(&mut self) {
+        // Closing the description releases the lock; unlocking first just makes
+        // the intent explicit.
+        unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&self.file), libc::LOCK_UN) };
+    }
+}
+
 /// A session id becomes a directory name under the ledger root, so it may not
 /// navigate out of it. Without this, `--session ../../elsewhere` made the engine
 /// create and write a session outside its own ledger directory.
@@ -195,6 +237,18 @@ impl Session {
         self.index.save(&self.root.join("index.json"))
     }
 
+    /// Take the session lock and re-read the state it protects.
+    ///
+    /// Every mutating operation starts here. Reloading is the point: the caller
+    /// loaded this `Session` before the lock existed, so its in-memory index and
+    /// ledger position may already be stale.
+    fn begin_write(&mut self) -> Result<SessionLock> {
+        let guard = SessionLock::acquire(&self.root)?;
+        self.index = ChangeIndex::load(&self.root.join("index.json"))?;
+        self.ledger = Ledger::open(self.ledger_path())?;
+        Ok(guard)
+    }
+
     pub fn ledger_path(&self) -> PathBuf {
         self.root.join("ledger.jsonl")
     }
@@ -244,6 +298,10 @@ impl Session {
         if params.argv.is_empty() {
             return Err(Error::Invalid("argv must not be empty".into()));
         }
+        // One writer at a time: the observation layer is shared, so a second
+        // call running concurrently would also see the first one's writes and
+        // attribute them to itself.
+        let _guard = self.begin_write()?;
 
         let call_dir = self.root.join("calls").join(sanitize(&params.call));
         fsutil::ensure_dir(&call_dir)?;
@@ -936,7 +994,10 @@ impl Session {
     ///
     /// The ledger is not touched at all. Pruning loses the ability to
     /// re-materialise an old state, never the record that it existed.
-    pub fn gc(&self, keep: usize, dry_run: bool) -> Result<GcResult> {
+    pub fn gc(&mut self, keep: usize, dry_run: bool) -> Result<GcResult> {
+        // Pruning reads the index to decide what is protected, and another call
+        // could be adding to it right now.
+        let _guard = self.begin_write()?;
         let entries = ledger::read_all(&self.ledger_path())?;
         let mut protected: BTreeSet<String> = BTreeSet::new();
 
@@ -1044,6 +1105,7 @@ impl Session {
     /// first: a file the user edited mid-session aborts the whole apply rather
     /// than being silently clobbered.
     pub fn apply(&mut self, force: bool) -> Result<ApplyResult> {
+        let _guard = self.begin_write()?;
         if self.meta.mode == Mode::Snapshot {
             return Ok(ApplyResult {
                 session: self.meta.id.clone(),
@@ -1152,6 +1214,7 @@ impl Session {
     /// Put files back to their session baseline. In overlay mode this rewrites
     /// `upper/`; in snapshot mode it rewrites the workspace.
     pub fn restore(&mut self, path: Option<&str>, all: bool) -> Result<Vec<String>> {
+        let _guard = self.begin_write()?;
         let mut keys: Vec<String> = if all {
             self.index.entries.keys().cloned().collect()
         } else {

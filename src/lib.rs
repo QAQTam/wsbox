@@ -109,7 +109,7 @@ pub fn dispatch(envelope: &Envelope) -> Response {
         }),
 
         "gc" => parse::<protocol::GcParams>(&envelope.params).and_then(|params| {
-            let session = load_session(params.ledger_dir.as_deref(), &params.session)?;
+            let mut session = load_session(params.ledger_dir.as_deref(), &params.session)?;
             value(session.gc(params.keep, params.dry_run)?)
         }),
 
