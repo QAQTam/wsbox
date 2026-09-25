@@ -123,6 +123,91 @@ downgrades** — callers decide whether the weaker guarantee is acceptable.
 
 `wsbox verify` walks the chain: a modified entry fails verification.
 
+## Audit and retention
+
+**The ledger and the content store have separate retention policies.** That
+separation is the answer to "won't this grow forever?".
+
+The ledger is the record of *what happened* — a few hundred bytes per call, so a
+thousand calls cost a few hundred kilobytes. It is never pruned.
+
+The CAS holds *what the bytes were*. It is pruned, and pruning only costs the
+ability to re-materialise an old state, never the record that it existed:
+
+```bash
+wsbox query   --session s1 --path src/main.rs   # who touched it, when, with what argv
+wsbox query   --session s1 --call call-42
+wsbox history --session s1 --path src/main.rs   # every state, with availability
+wsbox status  --session s1                      # storage, and the snapshot counterfactual
+wsbox gc      --session s1 --keep 5 --dry-run
+```
+
+```
+$ wsbox history --session s1 --path big.txt
+
+history of big.txt
+
+  baseline  d768026d20a9  available
+
+  [0] modify  -> 82b2658fd589  c1   before:ok  after:pruned
+  [1] modify  -> 72d063c0ac01  c2   before:pruned  after:pruned
+  ...
+  [29] modify -> 5f3ac1e9b204  c30  before:ok  after:ok
+```
+
+### What gc protects, unconditionally
+
+| | |
+|---|---|
+| **Baseline** of every touched path | "restore what it looked like before the agent started" must always work. Its size is bounded by the set of touched files, not by the number of calls. |
+| **Current** state | this is what `apply` writes |
+| Last `keep` intermediates per path | default 5 |
+
+### Why this does not grow like snapshotting
+
+| | 50 calls on a 500 MB repo |
+|---|---|
+| full snapshot before every call | `500 MB × 50` = **25 GB** |
+| overlay + CAS | only files actually written, deduplicated by digest |
+
+Three filters do the work:
+
+1. **overlayfs copies up only what is written.** Untouched files — `node_modules/`,
+   `target/` — cost nothing at all.
+2. **The CAS is content-addressed.** Identical bytes are stored once, and a
+   rewrite that reproduces the same bytes produces *no diff at all*
+   (`no_op_rewrite_produces_no_change` in the tests pins this).
+3. **Only the baseline is unbounded-lifetime**, and it is bounded in size.
+
+### The honest worst case
+
+Deduplication does nothing when every version is unique. **One large file
+rewritten with different content on every call is the worst case for content
+addressing**, and in that case the CAS can exceed what whole-tree snapshots would
+have cost:
+
+```
+$ wsbox status --session a1
+
+workspace   200007 bytes of content
+snapshot    6200217 bytes if the whole tree were copied before each call (cas is MORE EXPENSIVE)
+```
+
+That is what `gc` is for:
+
+```
+$ wsbox gc --session a1 --keep 3
+{ "kept": 7, "pruned": 26, "prunedBytes": 6900000 }
+
+$ wsbox status --session a1
+cas         7 blobs, 1400010 bytes
+snapshot    6200217 bytes if the whole tree were copied before each call (cas is cheaper)
+```
+
+For that workload the real fix is chunk-level storage (content-defined chunking,
+as restic/borg do) so that only changed chunks are stored. Not implemented yet;
+`gc` is the stopgap.
+
 ## Library use
 
 The engine is also a library, and the wire protocol is the stable surface:
@@ -160,6 +245,7 @@ Prototype. Working and covered by tests:
 - overlay + snapshot modes, capability probing
 - per-call diffs, delete/add/atomic-rename detection, suspicious-shrink flagging
 - CAS, hash-chained ledger, `apply` / `restore` / `discard` with conflict detection
+- audit surface: `query` / `history` / `status`, and `gc` with baseline-immortal retention
 
 Not yet:
 
@@ -167,3 +253,5 @@ Not yet:
 - fanotify/FUSE for full write fidelity (intermediate states within one call are
   not visible — only the end state)
 - landlock/seccomp enforcement layered on top of the mount isolation
+- chunk-level storage for the large-file-rewritten-repeatedly case
+- automatic retention: `gc` is currently manual

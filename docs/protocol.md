@@ -239,6 +239,119 @@ the workspace really was written. In overlay mode dropping the record is enough.
 
 ---
 
+## `ledger.query`
+
+The audit surface. The ledger records *what happened*; the CAS holds *what the
+bytes were*. Keeping those separate is what lets retention prune content without
+making the audit trail lie.
+
+```jsonc
+{
+  "session": "sess_7f3a",
+  "ledgerDir": "...",
+  "call": "call_42",          // optional: only this tool-call id
+  "path": "src/main.rs",      // optional: only entries touching this path
+  "sinceSeq": 10,             // optional: seq >= this
+  "limit": 50                 // optional: newest-first cap
+}
+```
+
+```jsonc
+{
+  "session": "sess_7f3a",
+  "entries": [ /* LedgerEntry, newest first */ ],
+  "total": 120,               // matching entries, before `limit`
+  "ledgerEntries": 4000,      // entries in the whole ledger
+  "head": "d1640421ba2f..."
+}
+```
+
+---
+
+## `history`
+
+Every state a path passed through, derived from the ledger rather than from a
+separate version store. A pruned blob still appears, flagged
+`available: false` — the history never silently loses an entry.
+
+```jsonc
+{ "session": "sess_7f3a", "path": "src/main.rs" }
+```
+
+```jsonc
+{
+  "session": "sess_7f3a",
+  "path": "src/main.rs",
+  "baselineSha": "d768026d20a9...",
+  "baselineAvailable": true,
+  "versions": [
+    {
+      "seq": 0, "call": "call_42", "atMs": 1758800000000, "op": "modify",
+      "beforeSha": "d768026d20a9...", "beforeBytes": 5180, "beforeAvailable": true,
+      "afterSha": "82b2658fd589...", "afterBytes": 0, "afterAvailable": false
+    }
+  ]
+}
+```
+
+---
+
+## `gc`
+
+Prunes intermediate content versions. Retention is deliberately asymmetric:
+
+- the **baseline** of every touched path is never evicted — restoring the
+  pre-session state must always work, and its size is bounded by the set of
+  touched files rather than by the number of calls;
+- the **current** state is never evicted — that is what `apply` writes;
+- intermediates keep the most recent `keep` per path (default 5).
+
+The ledger is not touched. `dryRun` reports what would go without deleting.
+
+```jsonc
+{ "session": "sess_7f3a", "keep": 5, "dryRun": false }
+```
+
+```jsonc
+{
+  "session": "sess_7f3a",
+  "dryRun": false,
+  "kept": 7,
+  "pruned": 26,
+  "prunedBytes": 6900000,
+  "affected": ["big.txt"]
+}
+```
+
+---
+
+## `status`
+
+Storage and activity summary, including the counterfactual that makes the
+retention question concrete.
+
+```jsonc
+{
+  "session": "sess_7f3a",
+  "workspace": "/home/u/proj",
+  "mode": "overlay",
+  "changedPaths": 2,
+  "ledgerEntries": 31,
+  "ledgerBytes": 19422,
+  "calls": 31,
+  "casBlobs": 33,
+  "casBytes": 8300010,
+  "workspaceBytes": 200007,
+  "naiveSnapshotBytes": 6200217
+}
+```
+
+`naiveSnapshotBytes` is `workspaceBytes * calls`. Compare it against `casBytes` —
+and note that for a single large file rewritten with distinct content every call,
+the CAS is the more expensive of the two until `gc` runs.
+
+---
+
 ## `ledger.verify`
 
 Walks the hash chain in `ledger.jsonl`.

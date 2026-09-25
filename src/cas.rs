@@ -86,4 +86,59 @@ impl Cas {
         fs::rename(&temp, target).map_err(|error| Error::io(target, error))?;
         Ok(true)
     }
+
+    /// Every blob currently stored, as `(digest, path, bytes)`.
+    pub fn iter(&self) -> Result<Vec<(String, PathBuf, u64)>> {
+        let mut out = Vec::new();
+        let outer = match fs::read_dir(&self.root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+            Err(error) => return Err(Error::io(&self.root, error)),
+        };
+        for entry in outer {
+            let entry = entry.map_err(|error| Error::io(&self.root, error))?;
+            if !entry.path().is_dir() {
+                continue;
+            }
+            let head = entry.file_name().to_string_lossy().to_string();
+            let inner =
+                fs::read_dir(entry.path()).map_err(|error| Error::io(entry.path(), error))?;
+            for blob in inner {
+                let blob = blob.map_err(|error| Error::io(entry.path(), error))?;
+                let tail = blob.file_name().to_string_lossy().to_string();
+                if tail.starts_with('.') {
+                    continue;
+                }
+                let metadata = blob
+                    .metadata()
+                    .map_err(|error| Error::io(blob.path(), error))?;
+                if !metadata.is_file() {
+                    continue;
+                }
+                out.push((format!("{head}{tail}"), blob.path(), metadata.len()));
+            }
+        }
+        Ok(out)
+    }
+
+    /// `(blob count, total bytes)`.
+    pub fn stats(&self) -> Result<(u64, u64)> {
+        let blobs = self.iter()?;
+        Ok((
+            blobs.len() as u64,
+            blobs.iter().map(|(_, _, size)| size).sum(),
+        ))
+    }
+
+    pub fn remove(&self, sha: &str) -> Result<u64> {
+        let path = self.path_for(sha);
+        match fs::metadata(&path) {
+            Ok(metadata) => {
+                fs::remove_file(&path).map_err(|error| Error::io(&path, error))?;
+                Ok(metadata.len())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+            Err(error) => Err(Error::io(path, error)),
+        }
+    }
 }

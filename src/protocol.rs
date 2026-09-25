@@ -371,3 +371,129 @@ impl ChangeIndex {
         crate::fsutil::write_atomic(path, &bytes)
     }
 }
+
+/* ------------------------------ audit surface --------------------------- */
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LedgerQueryParams {
+    pub session: String,
+    #[serde(default)]
+    pub ledger_dir: Option<PathBuf>,
+    /// Only entries attributed to this tool-call id.
+    #[serde(default)]
+    pub call: Option<String>,
+    /// Only entries that touched this workspace-relative path.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Only entries with `seq >= since_seq`.
+    #[serde(default)]
+    pub since_seq: Option<u64>,
+    /// Newest-first cap on returned entries. `total` still reports the full
+    /// match count.
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LedgerQueryResult {
+    pub session: String,
+    pub entries: Vec<crate::ledger::LedgerEntry>,
+    /// Entries matching the filter, before `limit` was applied.
+    pub total: u64,
+    /// Entries in the whole ledger.
+    pub ledger_entries: u64,
+    pub head: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryParams {
+    pub session: String,
+    #[serde(default)]
+    pub ledger_dir: Option<PathBuf>,
+    pub path: String,
+}
+
+/// One observed state of a path, derived from the ledger rather than from a
+/// separate version store — the ledger is the audit record, the CAS only holds
+/// the bytes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Version {
+    pub seq: u64,
+    pub call: String,
+    pub at_ms: u64,
+    pub op: Op,
+    pub before_sha: Option<String>,
+    pub before_bytes: Option<u64>,
+    /// False once retention has evicted the blob. The record of what happened
+    /// survives; only the ability to re-materialise it is lost.
+    pub before_available: bool,
+    pub after_sha: Option<String>,
+    pub after_bytes: Option<u64>,
+    pub after_available: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryResult {
+    pub session: String,
+    pub path: String,
+    /// Session-start content. Retention never evicts this.
+    pub baseline_sha: Option<String>,
+    pub baseline_available: bool,
+    pub versions: Vec<Version>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GcParams {
+    pub session: String,
+    #[serde(default)]
+    pub ledger_dir: Option<PathBuf>,
+    /// Intermediate versions kept per path, in addition to the baseline and the
+    /// current state. `0` keeps only those two.
+    #[serde(default = "default_keep")]
+    pub keep: usize,
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+fn default_keep() -> usize {
+    5
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GcResult {
+    pub session: String,
+    pub dry_run: bool,
+    pub kept: u64,
+    pub pruned: u64,
+    pub pruned_bytes: u64,
+    /// Paths whose history lost versions to this pass.
+    pub affected: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StatusResult {
+    pub session: String,
+    pub workspace: PathBuf,
+    pub mode: Mode,
+    pub changed_paths: usize,
+    pub ledger_entries: u64,
+    pub ledger_bytes: u64,
+    pub calls: usize,
+    pub cas_blobs: u64,
+    pub cas_bytes: u64,
+    /// Total size of the workspace's regular files right now.
+    pub workspace_bytes: u64,
+    /// `workspaceBytes * calls`: what copying the whole workspace before every
+    /// call would have cost. Compare against `casBytes` — and be aware that for
+    /// a single large file rewritten with distinct content every time, the CAS
+    /// is the more expensive of the two until `gc` runs.
+    pub naive_snapshot_bytes: u64,
+}

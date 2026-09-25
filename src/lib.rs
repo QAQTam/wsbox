@@ -92,6 +92,28 @@ pub fn dispatch(envelope: &Envelope) -> Response {
         "session.discard" => parse::<protocol::SessionRef>(&envelope.params)
             .and_then(|params| discard(params.ledger_dir.as_deref(), &params.session)),
 
+        "ledger.query" => {
+            parse::<protocol::LedgerQueryParams>(&envelope.params).and_then(|params| {
+                let session = load_session(params.ledger_dir.as_deref(), &params.session)?;
+                value(session.query_ledger(&params)?)
+            })
+        }
+
+        "history" => parse::<protocol::HistoryParams>(&envelope.params).and_then(|params| {
+            let session = load_session(params.ledger_dir.as_deref(), &params.session)?;
+            value(session.history(&params.path)?)
+        }),
+
+        "gc" => parse::<protocol::GcParams>(&envelope.params).and_then(|params| {
+            let session = load_session(params.ledger_dir.as_deref(), &params.session)?;
+            value(session.gc(params.keep, params.dry_run)?)
+        }),
+
+        "status" => parse::<protocol::SessionRef>(&envelope.params).and_then(|params| {
+            let session = load_session(params.ledger_dir.as_deref(), &params.session)?;
+            value(session.status()?)
+        }),
+
         "ledger.verify" => parse::<protocol::SessionRef>(&envelope.params).and_then(|params| {
             let session = load_session(params.ledger_dir.as_deref(), &params.session)?;
             let entries = ledger::verify(&session.ledger_path())?;

@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 
 use tempfile::TempDir;
-use wsbox::protocol::{ExecParams, Mode, Network, SessionOpenParams, Spec};
+use wsbox::protocol::{ExecParams, LedgerQueryParams, Mode, Network, SessionOpenParams, Spec};
 use wsbox::session::Session;
 
 struct Fixture {
@@ -391,6 +391,255 @@ fn ledger_directory_is_masked_inside_the_sandbox() {
         !result.stdout.contains("sessions") || !result.stdout.contains("ledger.jsonl"),
         "the ledger contents must not be listable from inside: {}",
         result.stdout
+    );
+}
+
+/* --------------------------------- audit -------------------------------- */
+
+#[test]
+fn ledger_query_filters_by_call_and_path() {
+    if !overlay_available() {
+        skip("overlayfs unavailable in a user namespace");
+        return;
+    }
+
+    let fixture = Fixture::new();
+    fixture.write("a.txt", "one\n");
+    fixture.write("b.txt", "two\n");
+
+    let mut session = fixture.open("query", Mode::Overlay);
+    exec(&mut session, "call-a", "echo x > a.txt");
+    exec(&mut session, "call-b", "echo y > b.txt");
+
+    let by_call = session
+        .query_ledger(&LedgerQueryParams {
+            session: session.meta.id.clone(),
+            ledger_dir: None,
+            call: Some("call-a".into()),
+            path: None,
+            since_seq: None,
+            limit: None,
+        })
+        .expect("query by call");
+    assert_eq!(by_call.total, 1);
+    assert_eq!(by_call.ledger_entries, 2);
+    assert_eq!(by_call.entries[0].call, "call-a");
+
+    let by_path = session
+        .query_ledger(&LedgerQueryParams {
+            session: session.meta.id.clone(),
+            ledger_dir: None,
+            call: None,
+            path: Some("b.txt".into()),
+            since_seq: None,
+            limit: None,
+        })
+        .expect("query by path");
+    assert_eq!(by_path.total, 1);
+    assert_eq!(by_path.entries[0].call, "call-b");
+
+    // Newest first, and `total` still reports the full match count.
+    let limited = session
+        .query_ledger(&LedgerQueryParams {
+            session: session.meta.id.clone(),
+            ledger_dir: None,
+            call: None,
+            path: None,
+            since_seq: None,
+            limit: Some(1),
+        })
+        .expect("query limited");
+    assert_eq!(limited.total, 2);
+    assert_eq!(limited.entries.len(), 1);
+    assert_eq!(limited.entries[0].call, "call-b");
+}
+
+/// Retention must never cost the audit trail, only the ability to
+/// re-materialise an old state.
+#[test]
+fn history_survives_pruning() {
+    if !overlay_available() {
+        skip("overlayfs unavailable in a user namespace");
+        return;
+    }
+
+    let fixture = Fixture::new();
+    fixture.write("a.txt", "v0\n");
+
+    let mut session = fixture.open("prune", Mode::Overlay);
+    for index in 1..=6 {
+        exec(
+            &mut session,
+            &format!("call-{index}"),
+            &format!("echo v{index} > a.txt"),
+        );
+    }
+
+    let before = session.history("a.txt").expect("history");
+    assert_eq!(before.versions.len(), 6);
+    assert!(before.baseline_available, "the baseline is never evicted");
+    assert!(
+        before.versions.iter().all(|v| v.after_available),
+        "nothing has been pruned yet"
+    );
+
+    let gc = session.gc(1, false).expect("gc");
+    assert!(gc.pruned > 0, "gc should have reclaimed something");
+
+    let after = session.history("a.txt").expect("history");
+    assert_eq!(
+        after.versions.len(),
+        6,
+        "pruning content must not delete the record of what happened"
+    );
+    assert!(
+        after.baseline_available,
+        "the baseline must survive gc unconditionally"
+    );
+    assert!(
+        after.versions.iter().any(|v| !v.after_available),
+        "old intermediates should be gone"
+    );
+    assert!(
+        after.versions.last().unwrap().after_available,
+        "the current state must survive gc"
+    );
+}
+
+/// The two guarantees gc must not break: applying the current state, and
+/// restoring to the baseline.
+#[test]
+fn gc_keeps_restore_and_apply_working() {
+    if !overlay_available() {
+        skip("overlayfs unavailable in a user namespace");
+        return;
+    }
+
+    let fixture = Fixture::new();
+    let original = large_file(200);
+    fixture.write("a.txt", &original);
+
+    let mut session = fixture.open("gc-safe", Mode::Overlay);
+    for index in 1..=5 {
+        exec(
+            &mut session,
+            &format!("call-{index}"),
+            &format!("echo version-{index} > a.txt"),
+        );
+    }
+
+    let gc = session.gc(1, false).expect("gc");
+    assert!(gc.pruned > 0);
+
+    // The ledger chain is untouched by gc.
+    assert_eq!(
+        wsbox::ledger::verify(&session.ledger_path()).expect("verify"),
+        5
+    );
+
+    // Apply still works: the current state is protected.
+    let applied = session.apply(false).expect("apply");
+    assert!(applied.ok, "{:?}", applied.conflicts);
+    assert_eq!(fixture.read("a.txt"), "version-5\n");
+
+    // Restore still works: the baseline is protected. In overlay mode this
+    // rewrites `upper/`, i.e. what the sandbox sees — the real workspace keeps
+    // the applied state until the session is discarded.
+    session.restore(Some("a.txt"), false).expect("restore");
+    let upper = session.root.join("upper").join("a.txt");
+    assert_eq!(
+        std::fs::read_to_string(&upper).expect("upper"),
+        original,
+        "restore must put the sandbox view back to the baseline"
+    );
+    assert!(
+        session.changes().expect("changes").is_empty(),
+        "a restored path drops out of the change set"
+    );
+}
+
+/// Content addressing must not store the same bytes twice.
+#[test]
+fn identical_content_is_stored_once() {
+    if !overlay_available() {
+        skip("overlayfs unavailable in a user namespace");
+        return;
+    }
+
+    let fixture = Fixture::new();
+    let shared = "the same content in both files\n".repeat(100);
+    fixture.write("a.txt", &shared);
+    fixture.write("b.txt", &shared);
+
+    let mut session = fixture.open("dedupe", Mode::Overlay);
+    exec(
+        &mut session,
+        "call-1",
+        "echo extra >> a.txt; echo extra >> b.txt",
+    );
+
+    let blobs = session.cas.iter().expect("cas");
+    let digests: std::collections::BTreeSet<&String> =
+        blobs.iter().map(|(sha, _, _)| sha).collect();
+    assert_eq!(
+        digests.len(),
+        blobs.len(),
+        "the CAS must never hold two blobs with the same digest"
+    );
+
+    // a.txt and b.txt had identical baselines and identical results, so the two
+    // files contribute exactly two distinct blobs between them.
+    assert!(
+        blobs.len() <= 4,
+        "expected deduplication, found {} blobs",
+        blobs.len()
+    );
+}
+
+/// A large file rewritten with distinct content every call is the worst case
+/// for content addressing. This is the case retention exists for.
+#[test]
+fn repeated_rewrites_are_bounded_by_gc() {
+    if !overlay_available() {
+        skip("overlayfs unavailable in a user namespace");
+        return;
+    }
+
+    let fixture = Fixture::new();
+    fixture.write("big.txt", &"x".repeat(200_000));
+
+    let mut session = fixture.open("growth", Mode::Overlay);
+    for index in 1..=8 {
+        exec(
+            &mut session,
+            &format!("call-{index}"),
+            &format!("python3 -c \"open('big.txt','w').write('v{index}'*100000)\""),
+        );
+    }
+
+    let before = session.status().expect("status");
+    assert!(
+        before.cas_bytes > 1_000_000,
+        "eight distinct 200 KB versions plus the baseline should exceed 1 MB, got {}",
+        before.cas_bytes
+    );
+
+    session.gc(2, false).expect("gc");
+
+    let after = session.status().expect("status");
+    assert!(
+        after.cas_bytes < before.cas_bytes / 2,
+        "gc should reclaim most of the intermediate versions: {} -> {}",
+        before.cas_bytes,
+        after.cas_bytes
+    );
+    assert_eq!(
+        after.ledger_entries, before.ledger_entries,
+        "gc must not touch the ledger"
+    );
+    assert_eq!(
+        after.changed_paths, before.changed_paths,
+        "gc must not change the session's change set"
     );
 }
 

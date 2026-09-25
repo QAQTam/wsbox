@@ -129,6 +129,23 @@ fn digest(entry: &LedgerEntry) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+/// Read every entry, in chain order.
+///
+/// The ledger is the audit record and is never pruned — entries are a few
+/// hundred bytes each, so a thousand calls cost a few hundred kilobytes. Only
+/// the content store behind it has a retention policy.
+pub fn read_all(path: &Path) -> Result<Vec<LedgerEntry>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(Error::io(path, error)),
+    };
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).map_err(Error::Json))
+        .collect()
+}
+
 /// Verify a ledger file's chain. Returns the number of entries checked.
 pub fn verify(path: &Path) -> Result<u64> {
     let text = std::fs::read_to_string(path).map_err(|error| Error::io(path, error))?;

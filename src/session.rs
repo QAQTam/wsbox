@@ -9,7 +9,7 @@
 //!   the live tree against it. The workspace *is* written, but every write is
 //!   still recoverable. This is what runs where user namespaces are blocked.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -21,8 +21,9 @@ use crate::error::{Error, Result};
 use crate::fsutil::{self, Kind, Manifest};
 use crate::ledger::{self, Ledger, LedgerChange, LedgerEntry};
 use crate::protocol::{
-    ApplyResult, Change, ChangeIndex, ExecParams, ExecResult, IndexEntry, Mode, Op,
-    SessionOpenParams, SessionOpenResult, Spec,
+    ApplyResult, Change, ChangeIndex, ExecParams, ExecResult, GcResult, HistoryResult, IndexEntry,
+    LedgerQueryParams, LedgerQueryResult, Mode, Op, SessionOpenParams, SessionOpenResult, Spec,
+    StatusResult, Version,
 };
 use crate::sandbox::{OverlayDirs, RunRequest};
 
@@ -604,6 +605,221 @@ impl Session {
         Ok(out)
     }
 
+    /// Query the audit ledger.
+    ///
+    /// The ledger is the record of *what happened*; the CAS is the record of
+    /// *what the bytes were*. Keeping the two separate is what lets retention
+    /// prune content without making the audit trail lie.
+    pub fn query_ledger(&self, params: &LedgerQueryParams) -> Result<LedgerQueryResult> {
+        let all = ledger::read_all(&self.ledger_path())?;
+        let path_filter = match &params.path {
+            Some(path) => Some(fsutil::relative_key(path)?),
+            None => None,
+        };
+
+        let matched: Vec<LedgerEntry> = all
+            .iter()
+            .filter(|entry| {
+                if let Some(call) = &params.call
+                    && &entry.call != call
+                {
+                    return false;
+                }
+                if let Some(since) = params.since_seq
+                    && entry.seq < since
+                {
+                    return false;
+                }
+                if let Some(path) = &path_filter
+                    && !entry.changes.iter().any(|change| &change.path == path)
+                {
+                    return false;
+                }
+                true
+            })
+            .cloned()
+            .collect();
+
+        let total = matched.len() as u64;
+        let mut entries = matched;
+        if let Some(limit) = params.limit {
+            // Newest first: an audit question is almost always "what happened
+            // recently", and the tail is what a caller can afford to drop.
+            if entries.len() > limit {
+                entries.drain(..entries.len() - limit);
+            }
+        }
+        entries.reverse();
+
+        Ok(LedgerQueryResult {
+            session: self.meta.id.clone(),
+            entries,
+            total,
+            ledger_entries: all.len() as u64,
+            head: self.ledger_head()?,
+        })
+    }
+
+    /// Every state a path passed through, with availability of each blob.
+    ///
+    /// Derived from the ledger rather than from a separate version store, so a
+    /// pruned blob still appears — flagged `available: false` — instead of the
+    /// history silently losing an entry.
+    pub fn history(&self, path: &str) -> Result<HistoryResult> {
+        let key = fsutil::relative_key(path)?;
+        let mut versions = Vec::new();
+
+        for entry in ledger::read_all(&self.ledger_path())? {
+            for change in entry.changes.iter().filter(|c| c.path == key) {
+                versions.push(Version {
+                    seq: entry.seq,
+                    call: entry.call.clone(),
+                    at_ms: entry.at_ms,
+                    op: parse_op(&change.op),
+                    before_available: change
+                        .before_sha
+                        .as_deref()
+                        .map(|sha| self.cas.has(sha))
+                        .unwrap_or(true),
+                    after_available: change
+                        .after_sha
+                        .as_deref()
+                        .map(|sha| self.cas.has(sha))
+                        .unwrap_or(true),
+                    before_sha: change.before_sha.clone(),
+                    before_bytes: change.before_bytes,
+                    after_sha: change.after_sha.clone(),
+                    after_bytes: change.after_bytes,
+                });
+            }
+        }
+
+        let indexed = self.index.entries.get(&key);
+        Ok(HistoryResult {
+            session: self.meta.id.clone(),
+            path: key,
+            baseline_sha: indexed.and_then(|entry| entry.baseline_sha.clone()),
+            baseline_available: indexed
+                .and_then(|entry| entry.baseline_sha.as_deref())
+                .map(|sha| self.cas.has(sha))
+                .unwrap_or(true),
+            versions,
+        })
+    }
+
+    /// Prune intermediate content versions.
+    ///
+    /// Retention is deliberately asymmetric:
+    ///
+    /// * the **baseline** of every touched path is never evicted — "restore what
+    ///   it looked like before the agent started" must always work, and its size
+    ///   is bounded by the set of touched files, not by the number of calls;
+    /// * the **current** state is never evicted — that is what `apply` writes;
+    /// * intermediate versions keep the most recent `keep` per path.
+    ///
+    /// The ledger is not touched at all. Pruning loses the ability to
+    /// re-materialise an old state, never the record that it existed.
+    pub fn gc(&self, keep: usize, dry_run: bool) -> Result<GcResult> {
+        let entries = ledger::read_all(&self.ledger_path())?;
+        let mut protected: BTreeSet<String> = BTreeSet::new();
+
+        for entry in self.index.entries.values() {
+            if let Some(sha) = &entry.baseline_sha {
+                protected.insert(sha.clone());
+            }
+            if let Some(sha) = &entry.current_sha {
+                protected.insert(sha.clone());
+            }
+        }
+
+        // Walk each path's timeline backwards, keeping the newest `keep`
+        // distinct digests that are not already protected.
+        let mut seen: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for entry in entries.iter().rev() {
+            for change in &entry.changes {
+                let slots = seen.entry(change.path.clone()).or_default();
+                for sha in [change.after_sha.as_ref(), change.before_sha.as_ref()]
+                    .into_iter()
+                    .flatten()
+                {
+                    if slots.len() < keep && protected.insert(sha.clone()) {
+                        slots.insert(sha.clone());
+                    }
+                }
+            }
+        }
+
+        let mut pruned = 0u64;
+        let mut pruned_bytes = 0u64;
+        let mut affected: BTreeSet<String> = BTreeSet::new();
+
+        for (sha, _path, size) in self.cas.iter()? {
+            if protected.contains(&sha) {
+                continue;
+            }
+            if !dry_run {
+                self.cas.remove(&sha)?;
+            }
+            pruned += 1;
+            pruned_bytes += size;
+            // Attribute the loss back to the paths that referenced it.
+            for entry in &entries {
+                for change in &entry.changes {
+                    if change.before_sha.as_deref() == Some(sha.as_str())
+                        || change.after_sha.as_deref() == Some(sha.as_str())
+                    {
+                        affected.insert(change.path.clone());
+                    }
+                }
+            }
+        }
+
+        Ok(GcResult {
+            session: self.meta.id.clone(),
+            dry_run,
+            kept: protected.len() as u64,
+            pruned,
+            pruned_bytes,
+            affected: affected.into_iter().collect(),
+        })
+    }
+
+    /// Storage and activity summary, including the counterfactual that makes the
+    /// retention question concrete: what snapshotting the whole workspace before
+    /// every call would have cost.
+    pub fn status(&self) -> Result<StatusResult> {
+        let entries = ledger::read_all(&self.ledger_path())?;
+        let ledger_bytes = std::fs::metadata(self.ledger_path())
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        let (cas_blobs, cas_bytes) = self.cas.stats()?;
+
+        let calls = std::fs::read_dir(self.root.join("calls"))
+            .map(|dir| dir.count())
+            .unwrap_or(0);
+
+        // The honest counterfactual for "just snapshot every time".
+        let workspace_bytes: u64 = fsutil::scan_tree(&self.meta.workspace)?
+            .values()
+            .filter(|entry| entry.kind == Kind::File)
+            .map(|entry| entry.size)
+            .sum();
+
+        Ok(StatusResult {
+            session: self.meta.id.clone(),
+            workspace: self.meta.workspace.clone(),
+            mode: self.meta.mode,
+            changed_paths: self.index.entries.len(),
+            ledger_entries: entries.len() as u64,
+            ledger_bytes,
+            calls,
+            cas_blobs,
+            cas_bytes,
+            workspace_bytes,
+            naive_snapshot_bytes: workspace_bytes * calls as u64,
+        })
+    }
+
     /// Copy the session's state onto the real workspace.
     ///
     /// In snapshot mode the workspace already holds the changes, so this is a
@@ -803,6 +1019,16 @@ fn op_name(op: Op) -> &'static str {
         Op::Modify => "modify",
         Op::Delete => "delete",
         Op::Chmod => "chmod",
+    }
+}
+
+/// Inverse of [`op_name`], for reading the ledger back.
+fn parse_op(value: &str) -> Op {
+    match value {
+        "add" => Op::Add,
+        "delete" => Op::Delete,
+        "chmod" => Op::Chmod,
+        _ => Op::Modify,
     }
 }
 
