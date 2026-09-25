@@ -1,9 +1,10 @@
-# Handoff — 第一轮交付（v0.1.0）
+# Handoff — 第一轮内部检查点（checkpoint-1）
 
 > 交付定义：**bash 命令改了工作区里的文件，wsbox 必须正确识别出 diff** —— 不漏报、
 > 不误报、diff 与真实字节一致、`apply` / `restore` 能复现。
 >
-> 状态：**达到交付点**。tag `v0.1.0`。工作区干净，无未提交改动。
+> 状态：**内部检查点，不是 release**。tag `checkpoint-1`，用于内部测试；
+> 未发布、未建 GitHub Release、未承诺对外兼容。工作区干净，无未提交改动。
 
 ---
 
