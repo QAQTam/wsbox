@@ -65,11 +65,15 @@ pub fn dispatch(envelope: &Envelope) -> Response {
             value(result)
         }),
 
-        "changes" => parse::<protocol::SessionRef>(&envelope.params).and_then(|params| {
+        "changes" => parse::<protocol::ChangesParams>(&envelope.params).and_then(|params| {
             let session = load_session(params.ledger_dir.as_deref(), &params.session)?;
-            let changes = session.changes()?;
+            let changes = match &params.call {
+                Some(call) => session.changes_for_call(call)?,
+                None => session.changes()?,
+            };
             value(protocol::ChangesResult {
                 session: params.session,
+                call: params.call,
                 changes,
             })
         }),

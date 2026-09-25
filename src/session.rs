@@ -582,6 +582,34 @@ impl Session {
     }
 
     pub fn changes(&self) -> Result<Vec<Change>> {
+        self.changes_filtered(None)
+    }
+
+    /// Reconstruct one call's change set from the ledger and the CAS.
+    ///
+    /// The cumulative view is what `apply` writes, so it is the right input for
+    /// a gate on applying. It is the wrong input for judging a *call*, because
+    /// one destructive edit makes every later call look destructive too — the
+    /// signal never recovers, and a model's per-change discrimination becomes
+    /// unmeasurable.
+    pub fn changes_for_call(&self, call: &str) -> Result<Vec<Change>> {
+        self.changes_filtered(Some(call))
+    }
+
+    fn changes_filtered(&self, call: Option<&str>) -> Result<Vec<Change>> {
+        if let Some(call) = call {
+            let entries = ledger::read_all(&self.ledger_path())?;
+            let entry = entries
+                .iter()
+                .find(|entry| entry.call == call)
+                .ok_or_else(|| Error::Invalid(format!("no call `{call}` in this session")))?;
+            return entry
+                .changes
+                .iter()
+                .map(|change| self.change_from_ledger(change))
+                .collect();
+        }
+
         let mut out = Vec::new();
         for (key, entry) in &self.index.entries {
             let before_content = match &entry.baseline_sha {
@@ -620,6 +648,40 @@ impl Session {
             });
         }
         Ok(out)
+    }
+
+    /// Rebuild one ledger change's diff from the content-addressed store.
+    fn change_from_ledger(&self, change: &LedgerChange) -> Result<Change> {
+        let before = match &change.before_sha {
+            Some(sha) => self.cas.get(sha)?,
+            None => None,
+        };
+        let after = match &change.after_sha {
+            Some(sha) => self.cas.get(sha)?,
+            None => None,
+        };
+        let (rendered, truncated) =
+            match diff::unified(before.as_deref(), after.as_deref(), &change.path) {
+                Some(text) => diff::clamp(&text, MAX_DIFF_BYTES),
+                None => (String::new(), false),
+            };
+        Ok(Change {
+            path: change.path.clone(),
+            op: parse_op(&change.op),
+            before_bytes: change.before_bytes,
+            after_bytes: change.after_bytes,
+            before_sha: change.before_sha.clone(),
+            after_sha: change.after_sha.clone(),
+            diff: if rendered.is_empty() {
+                None
+            } else {
+                Some(rendered)
+            },
+            diff_truncated: truncated,
+            suspicious: change.suspicious,
+            reason: None,
+            reversible: before.is_some() || change.before_sha.is_none(),
+        })
     }
 
     /// Query the audit ledger.

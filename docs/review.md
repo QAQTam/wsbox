@@ -304,17 +304,30 @@ $ wsbox-review --session s2                     # 空变更集
 nothing changed
 ```
 
-### 阶段 1 —— Jev 接入，**shadow 模式**
+### 阶段 1 —— Jev 接入，**shadow 模式** ✅ 已完成
 
-`--features jev` + `Mode::Hosted`，但 **`may_auto_apply()` 的结果只记录、不执行**。仍然问人。
+`--features jev` + `--shadow`。仍然问人，但把模型的判断记下来：
 
-这是接 LLM 审批的正确第一步：先观察它会不会放行你不该放行的东西。跑够样本后对比：
+```bash
+wsbox-review run --session s1 --call c2 --mode hosted --shadow --record --task "..."
+wsbox-review resolve --session s1 --review 2 --outcome reject --note "把函数写空了"
+wsbox-review stats --session s1
+```
 
 ```
-放行且人工也放行   → 一致，可以进入阶段 2
-放行但人工拒绝     → 危险，说明阈值太松或问题没覆盖
-拒绝但人工放行     → 太吵，会消耗耐心
+reviews 4   resolved 4   with fallbacks 0
+
+model said         applied  rejected  unresolved
+auto_apply               1         0           0
+review                   1         0           0
+hold                     0         2           0
+
+no dangerous auto-approvals in 4 resolved review(s).
 ```
+
+`shadow` 是 `ReviewOutcome` 的一个字段，`may_auto_apply()` 直接返回 false——**又一条类型级保证，而不是"记得别用"**。
+
+**放行但人工拒绝**（`dangerousAutoApprove`）必须在开启 auto-approve 前归零。这是唯一不能妥协的指标。
 
 ### 阶段 2 —— 开启 auto-approve
 
@@ -324,11 +337,80 @@ nothing changed
 
 用攒的数据拟合校准映射，或者训练自己的分类器，接到 `Chain` 里。Jev 降级为兜底。
 
-## 11. 当前限制
+## 11. 实测记录
 
-- **`Mode::Hosted` 未经真实 API 验证**——没有 API key，请求/响应映射是按官方文档写的，未对活接口跑过
-- 阈值是文档默认值，不是实测值
-- 没有 shadow 模式的一等支持（现在靠调用方忽略 `may_auto_apply()`）
-- 电池 v1 未在真实仓库上验证过区分度
-- 评估结果写进 `review.jsonl`，还没有回读/统计工具
+### Jev 接入已验证
+
+`Mode::Hosted` 已对活接口跑通（`jev-1.13.0`）。请求/响应映射与官方文档一致。
+
+四个真实场景的实测结果：
+
+| 场景 | 判定 | 依据 |
+|---|---|---|
+| 把 `helper()` 的返回值改掉（良性） | `auto_apply` | 无 hazard 触发 |
+| 用 python 把 `handle()` 函数体写空 | `hold` | 硬规则（缩水 80%）+ `lost_content 1.00` / `removed_behavior 0.97` / `beyond_task 0.95` / `breaks_contract 0.71` |
+| 改 `package-lock.json` | `hold` | **仅**硬规则；模型只给了 `beyond_task 0.39` |
+| 加一句注释（良性） | `auto_apply` | 无 hazard 触发 |
+| 用坏 key | `review` | `authentication rejected` |
+
+第三条是"模型是判断层不是边界"的实证：模型没看出问题，硬规则拦住了。
+
+成本：一个变更集约 430–900 input tokens，**约 $0.00002–0.00004**。
+
+### 实测发现的第一个设计错误
+
+第一轮 shadow 跑出来，四次评估里有三次的 fallback 是 `low_confidence`：
+
+```
+review 1  severity conf=0.21  category conf=0.26
+review 2  severity conf=0.45  category conf=0.32
+review 3  severity conf=0.00  category conf=0.35
+review 4  severity conf=1.00  category conf=0.73   ← 只有这个过了 0.50
+```
+
+**根因：`min_confidence` 被无差别地施加在所有答案上。**
+
+但 `severity` 是**放大器**不是**闸门**——对它不确定，应该是"不放大"，而不是"叫醒一个人"。无差别下限导致几乎每个变更集都因为一个和风险无关的原因被升级，把真正有区分度的信号淹没了。
+
+修正：置信度下限只作用于 `policy.hazards` 里被真正用作闸门的问题（当前全是 noul，本来就不带 confidence，所以基本是 no-op）；`severity` 只有置信度够高时才参与放大。
+
+修正后同一组场景：
+
+```
+良性：改返回值    -> auto_apply   fired=[]                     fallbacks=[]
+破坏性：写空      -> hold         fired=[beyond_task .95, breaks_contract .75,
+                                        lost_content 1.0, removed_behavior .98,
+                                        touches_security .78]   fallbacks=[]
+lockfile          -> hold         fired=[beyond_task .39]      fallbacks=[]
+良性：加注释      -> auto_apply   fired=[]                     fallbacks=[]
+```
+
+**这正是 shadow 模式存在的意义**：如果第一轮就开 auto-approve，这个错误的表现是"每个改动都弹窗"，人会直接关掉这个功能，而不是发现阈值配错了。
+
+### 观察：模型有 run-to-run 波动
+
+同一份变更集，`breaks_contract` 一次跑出 0.35、另一次跑出低于 0.35 未触发。**阈值附近的判断会翻转。**
+
+官方自洽性 cookbook 的做法（同一问题跑两次，不稳的送人工）对边界情况是必要的。目前没实现，但 `--record` 已经在积累数据，可以用来量化波动幅度。
+
+### 观察：必须按 call 审查，不能只审累积集
+
+第一轮实验用累积变更集，结果是：一旦某次调用破坏了文件，**之后每一次评估都是 hold**——信号再也不恢复。
+
+对 `apply` 闸门来说累积集是对的（你 apply 的就是累积集），但对"判断一次调用"来说是错的。所以加了 `--call`：
+
+```bash
+wsbox-review run --session s1 --call c2 --mode hosted --task "..."
+```
+
+wsbox 侧对应新增 `changes --call <id>`，从账本 + CAS 重建单次调用的 diff。
+
+## 12. 当前限制
+
+- 阈值是文档默认值，**尚未用你自己仓库的数据调过**
+- 中文准确率：官方明说 CJK 不如英文，**必须实测**
+- 没有自洽性检查（同一输入跑两次比对）
+- 没有 shadow 结果的自动回填——`resolve` 要人手动记
+- 电池 v1 未在真实仓库上验证区分度（只在 4 个构造场景上验证过）
 - 未与 bugent / qaqh-backend 接线
+- `min_confidence` 的 0.50 是猜的，需要用 §9 的数据重新定

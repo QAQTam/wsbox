@@ -13,8 +13,9 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use wsbox::protocol::{
-    ApplyParams, Backend, Envelope, ExecParams, GcParams, HistoryParams, LedgerQueryParams, Mode,
-    Network, PROTOCOL_VERSION, Response, RestoreParams, SessionOpenParams, SessionRef, Spec,
+    ApplyParams, Backend, ChangesParams, Envelope, ExecParams, GcParams, HistoryParams,
+    LedgerQueryParams, Mode, Network, PROTOCOL_VERSION, Response, RestoreParams, SessionOpenParams,
+    SessionRef, Spec,
 };
 
 #[derive(Parser)]
@@ -86,6 +87,9 @@ enum Command {
         session: String,
         #[arg(long)]
         ledger_dir: Option<PathBuf>,
+        /// Restrict to one tool call's changes.
+        #[arg(long)]
+        call: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -349,14 +353,16 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
         Command::Changes {
             session,
             ledger_dir,
+            call,
             json,
         } => {
             let response = wsbox::dispatch(&Envelope {
                 protocol: PROTOCOL_VERSION,
                 method: "changes".into(),
-                params: to_value(&SessionRef {
+                params: to_value(&ChangesParams {
                     session,
                     ledger_dir,
+                    call,
                 })?,
                 id: None,
             });

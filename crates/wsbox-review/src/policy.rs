@@ -327,23 +327,40 @@ pub fn route(state: &ChangeSetState, assessment: &Assessment, policy: &Policy) -
         }
     }
 
-    // 4. Confidence floor. Only answers that carry a confidence can be judged;
-    //    boolean answers express uncertainty through the probability band above.
-    for (question, answer) in &assessment.answers {
-        if let Some(confidence) = answer.confidence
+    // 4. Confidence floor, scoped to the questions the policy actually gates on.
+    //
+    //    A blanket floor over every answer looks prudent and is not: `severity`
+    //    is an amplifier, not a gate, so an uncertain severity is a reason not
+    //    to amplify — not a reason to wake a person. The first live run made
+    //    this concrete. Across four ordinary change sets, severity confidence
+    //    sat between 0.21 and 0.45, so a blanket floor escalated nearly
+    //    everything for a reason that had nothing to do with the change being
+    //    risky, and drowned out the signal that actually discriminated.
+    //
+    //    Gating questions today are all boolean and carry no confidence, so this
+    //    is usually a no-op — the mechanism is here for rubric or category
+    //    questions that get promoted to gates.
+    for question in policy.hazards.keys() {
+        if let Some(answer) = assessment.answer(question)
+            && let Some(confidence) = answer.confidence
             && confidence < policy.min_confidence
         {
             fallbacks.push(FallbackReason::LowConfidence { confidence });
-            let _ = question;
         }
     }
 
     // 5. Severity amplifies everything: a high-severity change turns a review
     //    into a hold, and a high-severity change that fired nothing still gets a
-    //    look.
+    //    look. It only amplifies when the assessor is reasonably sure of it —
+    //    an uncertain severity must not manufacture a hold.
     let severity = assessment
         .answer(battery::SEVERITY)
         .filter(|answer| answer.calibration.is_trustworthy())
+        .filter(|answer| {
+            answer
+                .confidence
+                .is_none_or(|confidence| confidence >= policy.min_confidence)
+        })
         .and_then(|answer| answer.level);
 
     let severe = severity.is_some_and(|level| level >= policy.severity_escalate);
@@ -554,15 +571,38 @@ mod tests {
     }
 
     #[test]
-    fn low_confidence_reviews() {
+    fn low_confidence_on_a_gate_reviews() {
+        // Promote a rubric question to a gate, then make it unsure.
+        let mut policy = Policy::default();
+        policy
+            .hazards
+            .insert(battery::SEVERITY.to_string(), HazardAction::Review);
+
         let mut assessment = quiet();
         assessment.answers.insert(
             battery::SEVERITY.to_string(),
             Answer::level(0.0, 0.2, Calibration::Calibrated { source: "t".into() }),
         );
         assert_eq!(
-            route(&state(), &assessment, &Policy::default()).action(),
+            route(&state(), &assessment, &policy).action(),
             Action::Review
+        );
+    }
+
+    /// The finding from the first live run: an uncertain *amplifier* must not
+    /// wake a person. Across four ordinary change sets severity confidence sat
+    /// between 0.21 and 0.45, so a blanket floor escalated nearly everything.
+    #[test]
+    fn an_uncertain_severity_does_not_escalate() {
+        let mut assessment = quiet();
+        assessment.answers.insert(
+            battery::SEVERITY.to_string(),
+            Answer::level(1.0, 0.2, Calibration::Calibrated { source: "t".into() }),
+        );
+        assert_eq!(
+            route(&state(), &assessment, &Policy::default()).action(),
+            Action::AutoApply,
+            "an unsure severity must not manufacture a hold"
         );
     }
 

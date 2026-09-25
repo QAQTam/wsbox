@@ -76,28 +76,53 @@ pub struct ReviewOutcome {
     pub state: ChangeSetState,
     pub battery: Battery,
     pub mode: Mode,
+    /// Shadow mode: record the model's verdict, but do not act on it.
+    ///
+    /// This is the only responsible way to switch a review model on. An
+    /// auto-approval that is wrong is invisible — nothing bad happens until
+    /// someone notices later. Running in shadow first means the disagreement
+    /// between the model and the human is measured *before* anything depends on
+    /// it.
+    pub shadow: bool,
 }
 
 impl ReviewOutcome {
-    /// Whether the caller may apply without asking. `Decision` can only be
-    /// constructed by the router, so this is the single gate.
+    /// Whether the caller may apply without asking.
+    ///
+    /// `Decision` can only be constructed by the router, and shadow mode can
+    /// only narrow it further — so this is the single gate, and it cannot be
+    /// widened from outside.
     pub fn may_auto_apply(&self) -> bool {
-        self.decision.is_auto_apply()
+        !self.shadow && self.decision.is_auto_apply()
+    }
+
+    /// What the model actually said, regardless of shadow mode. This is the
+    /// value worth recording and comparing against the human.
+    pub fn assessed_action(&self) -> Action {
+        self.decision.action()
     }
 }
 
 /// Run the whole pipeline: assess, then route.
-pub fn review(mut state: ChangeSetState, mode: Mode, policy: &Policy) -> ReviewOutcome {
-    let battery = battery::change_set();
+pub fn review(state: ChangeSetState, mode: Mode, policy: &Policy) -> ReviewOutcome {
+    review_with(state, mode, policy, false)
+}
+
+/// Run in shadow mode: assess and record, but never permit an auto-apply.
+pub fn review_shadow(state: ChangeSetState, mode: Mode, policy: &Policy) -> ReviewOutcome {
+    review_with(state, mode, policy, true)
+}
+
+fn review_with(state: ChangeSetState, mode: Mode, policy: &Policy, shadow: bool) -> ReviewOutcome {
     let mut assessors: Vec<Box<dyn Assessor>> = vec![Box::new(rules::Rules)];
     let mut prefixed_failures: Vec<BackendFailure> = Vec::new();
-    let mut model_backend = false;
+    let mut has_model = false;
 
     if mode == Mode::Hosted {
         match hosted_assessor() {
             Ok(assessor) => {
                 assessors.push(assessor);
-                model_backend = true;
+                has_model = true;
             }
             Err(reason) => {
                 // No usable backend. Record why, so the audit record can say
@@ -111,10 +136,46 @@ pub fn review(mut state: ChangeSetState, mode: Mode, policy: &Policy) -> ReviewO
         }
     }
 
+    review_with_assessors_inner(
+        state,
+        assessors,
+        prefixed_failures,
+        has_model,
+        policy,
+        shadow,
+    )
+}
+
+/// Run the pipeline against an explicit backend list.
+///
+/// `review()` with a [`Mode`] covers the built-in backends. This is the seam for
+/// anything else — a local model with its own weights, or a test that needs a
+/// backend whose behaviour is known. The caller is responsible for the rules
+/// pass if it wants one; it is not added implicitly, so the list means exactly
+/// what it says.
+pub fn review_with_assessors(
+    state: ChangeSetState,
+    assessors: Vec<Box<dyn Assessor>>,
+    policy: &Policy,
+    shadow: bool,
+) -> ReviewOutcome {
+    review_with_assessors_inner(state, assessors, Vec::new(), true, policy, shadow)
+}
+
+fn review_with_assessors_inner(
+    mut state: ChangeSetState,
+    assessors: Vec<Box<dyn Assessor>>,
+    prefixed_failures: Vec<BackendFailure>,
+    has_model: bool,
+    policy: &Policy,
+    shadow: bool,
+) -> ReviewOutcome {
+    let battery = battery::change_set();
+
     // Only trim for a backend that has a context window to fit. Trimming also
     // sets `any_diff_truncated`, which the hard rules turn into a hold — so the
     // trim can only ever make the outcome stricter.
-    if model_backend {
+    if has_model {
         state.trim_diffs(48_000);
     }
 
@@ -127,7 +188,12 @@ pub fn review(mut state: ChangeSetState, mode: Mode, policy: &Policy) -> ReviewO
         decision,
         state,
         battery,
-        mode,
+        mode: if has_model {
+            Mode::Hosted
+        } else {
+            Mode::RulesOnly
+        },
+        shadow,
     }
 }
 
@@ -186,13 +252,50 @@ mod tests {
         assert!(outcome.may_auto_apply());
     }
 
+    /// A backend that fails must leave its questions unanswered, and the router
+    /// must turn that into a human decision.
+    ///
+    /// Injected rather than simulated by clearing the environment: a unit test
+    /// whose result depends on whether `TYPESAFE_API_KEY` happens to be set in
+    /// the developer's shell is not a test.
     #[test]
-    fn a_missing_hosted_backend_falls_back_to_a_human() {
+    fn a_failing_backend_falls_back_to_a_human() {
+        struct Down;
+        impl Assessor for Down {
+            fn id(&self) -> &str {
+                "down"
+            }
+            fn supports(&self, _battery: &Battery) -> bool {
+                true
+            }
+            fn assess(
+                &self,
+                _state: &ChangeSetState,
+                _battery: &Battery,
+            ) -> std::result::Result<
+                std::collections::BTreeMap<question::QuestionId, Answer>,
+                AssessorError,
+            > {
+                Err(AssessorError::Unauthorized("key expired".into()))
+            }
+        }
+
         let state = ChangeSetState::from_changes(None, &[change("src/app.py", 100, 120)]);
-        let outcome = review(state, Mode::Hosted, &Policy::default());
+        let outcome = review_with_assessors(
+            state,
+            vec![Box::new(rules::Rules), Box::new(Down)],
+            &Policy::default(),
+            false,
+        );
+
         assert!(!outcome.may_auto_apply());
         assert!(
-            !outcome.decision.rationale().fallbacks.is_empty(),
+            outcome
+                .decision
+                .rationale()
+                .fallbacks
+                .iter()
+                .any(|reason| reason.describe().contains("key expired")),
             "the reason for falling back must be recorded"
         );
     }

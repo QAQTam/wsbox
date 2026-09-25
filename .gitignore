@@ -1,3 +1,8 @@
 /target
 *.swp
 .DS_Store
+
+# credentials — never commit a key
+.env
+.env.*
+*.key

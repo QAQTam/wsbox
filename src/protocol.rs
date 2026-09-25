@@ -307,8 +307,25 @@ pub struct SessionRef {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ChangesParams {
+    pub session: String,
+    #[serde(default)]
+    pub ledger_dir: Option<PathBuf>,
+    /// Restrict to a single tool call's changes.
+    ///
+    /// The cumulative set is what `apply` writes, so it is the right input for
+    /// a gate on applying. It is the wrong input for judging a call: one
+    /// destructive edit makes every later call look destructive too.
+    #[serde(default)]
+    pub call: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ChangesResult {
     pub session: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub call: Option<String>,
     pub changes: Vec<Change>,
 }
 
